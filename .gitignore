@@ -1,0 +1,39 @@
+# Node installation/runtime
+quip_node/
+nodes.quip.network/
+faucet/
+data/
+dashboard-data/
+pgdata/
+runtime/
+backups/
+
+# Secrets and local configs
+.env
+.env.*
+*.env
+keystore.json
+*keystore*.json
+*.seed
+*.key
+*.pem
+*.p12
+*.crt
+*.csr
+id_rsa*
+id_ed25519*
+
+# Logs and generated files
+*.log
+*.pid
+*.tmp
+*.bak
+*.backup
+*.xnode-backup-*
+xnode-quip-summary.txt
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+
