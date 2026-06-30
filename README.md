@@ -9,7 +9,7 @@ The script installs the official Quip Docker Compose stack, prepares a CPU miner
 Download the script on a fresh Ubuntu/Debian VM:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/XNODE-Team/xnode-quip/main/xnode-quip.sh -o xnode-quip.sh
+curl -fsSL https://raw.githubusercontent.com/Vitashka2001/xnode-quip/main/xnode-quip.sh -o xnode-quip.sh
 chmod +x xnode-quip.sh
 ./xnode-quip.sh
 ```
@@ -103,4 +103,3 @@ This repository must not contain:
 - Website: <https://quip.network/>
 - Node repository: <https://gitlab.com/quip.network/nodes.quip.network>
 - Faucet repository: <https://gitlab.com/quip.network/faucet>
-
