@@ -60,6 +60,14 @@ Backup `keystore.json`:
 ./xnode-quip.sh backup
 ```
 
+Safe Docker cleanup and disk report:
+
+```bash
+./xnode-quip.sh cleanup
+./xnode-quip.sh cleanup-status
+./xnode-quip.sh cleanup-install
+```
+
 Manage miner auto-recovery:
 
 ```bash
@@ -85,6 +93,8 @@ Recommended:
 - 80+ GB free disk
 
 GPU is not required. The installer uses the Quip CPU profile.
+
+Note: the bundled Quip validator runs as an archive node, so `data/validator-data` can grow significantly over time. The cleanup command prunes only safe Docker leftovers and does not delete validator chain data, Postgres volumes, or `keystore.json`.
 
 ## Security Notes
 

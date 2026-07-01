@@ -15,6 +15,8 @@ PUBLIC_IP_URL="https://api.ipify.org"
 CHECK_PORT_URL="https://check.quip.network/checkport?port="
 SUMMARY_FILE="${XNODE_SUMMARY_FILE:-$BASE_DIR/xnode-quip-summary.txt}"
 BACKUP_DIR="${XNODE_BACKUP_DIR:-$BASE_DIR/backups}"
+LOG_MAX_SIZE="${XNODE_LOG_MAX_SIZE:-50m}"
+LOG_MAX_FILE="${XNODE_LOG_MAX_FILE:-3}"
 
 MIN_CPU=2
 MIN_RAM_MB=3900
@@ -429,8 +431,15 @@ write_override_file() {
   local override_file="$REPO_DIR/docker-compose.override.yml"
 
   cat > "$override_file" <<EOF
+x-xnode-logging: &xnode-logging
+  driver: json-file
+  options:
+    max-size: "$LOG_MAX_SIZE"
+    max-file: "$LOG_MAX_FILE"
+
 services:
   cpu:
+    logging: *xnode-logging
     environment:
       QUIP_VALIDATORS: "$validators"
 EOF
@@ -440,6 +449,17 @@ EOF
       QUIP_FAUCET_URL: ""
 EOF
   fi
+
+  cat >> "$override_file" <<'EOF'
+  quip-validator:
+    logging: *xnode-logging
+  dashboard:
+    logging: *xnode-logging
+  postgres:
+    logging: *xnode-logging
+  caddy:
+    logging: *xnode-logging
+EOF
 }
 
 disable_faucet_in_override() {
@@ -635,6 +655,8 @@ asyncio.run(main())
 
 auto_recover_service_name="xnode-quip-auto-recover.service"
 auto_recover_timer_name="xnode-quip-auto-recover.timer"
+cleanup_service_name="xnode-quip-cleanup.service"
+cleanup_timer_name="xnode-quip-cleanup.timer"
 
 auto_recover_status_line() {
   local status
@@ -1417,6 +1439,7 @@ Notes:
   - If QuantumPow.DefaultTopology is missing, the miner account can be funded/registered but mining cannot start until Quip seeds topology on testnet.
   - Auto-recover can keep watching topology/miner health and restart the miner after Quip network updates.
   - Use menu item 10 or ./xnode-quip.sh check-updates to detect Git updates before applying them.
+  - Use menu item 13 or ./xnode-quip.sh cleanup to safely prune old Docker leftovers.
 EOF
   chmod 600 "$SUMMARY_FILE"
   say "Summary saved: $SUMMARY_FILE"
@@ -1448,6 +1471,238 @@ check_external_ports() {
   echo
   soft "Для no-domain режима Quip важны 20049 и 30333. 80/443 могут быть закрыты."
   pause
+}
+
+dir_size() {
+  local path="$1"
+  if [[ -e "$path" ]]; then
+    du -sh "$path" 2>/dev/null | awk '{print $1}'
+  else
+    echo "missing"
+  fi
+}
+
+largest_docker_logs() {
+  find /var/lib/docker/containers -name '*-json.log' -printf '%s %p\n' 2>/dev/null \
+    | sort -n \
+    | tail -10 \
+    | awk '{size=$1; $1=""; sub(/^ /,""); printf "  %8.1f MB  %s\n", size/1024/1024, $0}'
+}
+
+disk_report() {
+  section "Disk / storage"
+  kv "Root disk" "$(df -h "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2 {print $3 " used / " $4 " free / " $5}')"
+  kv "Install dir" "$BASE_DIR"
+  kv "Quip repo" "$(dir_size "$REPO_DIR")"
+  kv "Validator DB" "$(dir_size "$REPO_DIR/data/validator-data")"
+  kv "Miner runtime" "$(dir_size "$REPO_DIR/data/runtime")"
+  kv "Quip logs dir" "$(dir_size "$REPO_DIR/data/logs")"
+  kv "Docker dir" "$(dir_size /var/lib/docker)"
+  echo
+  say "Docker disk usage"
+  docker_cli system df 2>/dev/null || warn "Docker disk usage недоступен."
+  echo
+  say "Самые крупные Docker json logs"
+  largest_docker_logs || true
+  echo
+  soft "Важно: validator DB растёт потому что Quip validator запущен как archive node. Это рабочие chain data, их нельзя чистить как мусор."
+}
+
+current_override_validators() {
+  local override_file="$REPO_DIR/docker-compose.override.yml"
+  local value
+  if [[ -f "$override_file" ]]; then
+    value="$(awk -F'"' '/QUIP_VALIDATORS:/ {print $2; exit}' "$override_file" 2>/dev/null || true)"
+    if [[ -z "$value" ]]; then
+      value="$(sed -n 's/^[[:space:]]*QUIP_VALIDATORS:[[:space:]]*//p' "$override_file" 2>/dev/null | head -n1 | sed 's/^["'\'']//; s/["'\'']$//')"
+    fi
+  fi
+  echo "${value:-$LOCAL_VALIDATOR}"
+}
+
+current_faucet_mode() {
+  local override_file="$REPO_DIR/docker-compose.override.yml"
+  if [[ -f "$override_file" ]] && grep -Eq 'QUIP_FAUCET_URL:[[:space:]]*""' "$override_file"; then
+    echo "disabled"
+  else
+    echo "enabled"
+  fi
+}
+
+apply_log_limits_to_override() {
+  need_repo || return
+  local validators faucet_mode recreate="${1:-ask}"
+  validators="$(current_override_validators)"
+  faucet_mode="$(current_faucet_mode)"
+
+  backup_override_file >/dev/null || true
+  write_override_file "$faucet_mode" "$validators"
+  ok "Лимит Docker logs записан в docker-compose.override.yml: max-size=$LOG_MAX_SIZE, max-file=$LOG_MAX_FILE"
+
+  if [[ "$recreate" == "ask" ]]; then
+    warn "Чтобы Docker применил logging limit к уже запущенным контейнерам, нужно пересоздать stack."
+    read -r -p "Пересоздать Quip stack сейчас? [y/N]: " do_recreate || true
+    [[ "$do_recreate" =~ ^[Yy]$ ]] || return 0
+  fi
+
+  say "Применяю override и пересоздаю контейнеры..."
+  compose up -d --force-recreate
+  wait_for_miner 24 || true
+}
+
+safe_disk_cleanup() {
+  need_repo || return
+  local quiet="${1:-no}"
+
+  section "Безопасная очистка диска"
+  warn "Эта очистка НЕ удаляет keystore, validator-data, postgres volume и рабочую chain database."
+  echo
+  say "До очистки"
+  docker_cli system df 2>/dev/null || true
+  echo
+
+  say "Удаляю dangling Docker images (<none>)..."
+  docker_cli image prune -f || true
+  echo
+
+  say "Удаляю Docker build cache старше 24 часов..."
+  docker_cli builder prune -f --filter until=24h || true
+  echo
+
+  say "После очистки"
+  docker_cli system df 2>/dev/null || true
+  [[ "$quiet" == "yes" ]] || pause
+}
+
+truncate_docker_logs() {
+  need_repo || return
+  section "Очистка Docker json logs"
+  largest_docker_logs || true
+  echo
+  warn "Это очистит историю docker logs, но не тронет контейнеры и данные ноды."
+  read -r -p "Напиши YES чтобы обнулить Docker json logs: " confirm || true
+  if [[ "$confirm" != "YES" ]]; then
+    warn "Очистка логов отменена."
+    pause
+    return 0
+  fi
+  find /var/lib/docker/containers -name '*-json.log' -exec truncate -s 0 {} \; 2>/dev/null || true
+  ok "Docker json logs очищены."
+  pause
+}
+
+cleanup_status_line() {
+  local status
+  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "$cleanup_timer_name" >/dev/null 2>&1; then
+    status="$(systemctl is-enabled "$cleanup_timer_name" 2>/dev/null || true)"
+    echo "${status:-installed}"
+  else
+    echo "not installed"
+  fi
+}
+
+cleanup_next_run() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl show "$cleanup_timer_name" -p NextElapseUSecRealtime --value 2>/dev/null || true
+}
+
+install_cleanup_timer() {
+  need_repo || return
+  local quiet="${1:-no}"
+  local script_path="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+  local service_file="/etc/systemd/system/$cleanup_service_name"
+  local timer_file="/etc/systemd/system/$cleanup_timer_name"
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl не найден. Очистку можно запускать вручную: $script_path cleanup"
+    [[ "$quiet" == "yes" ]] || pause
+    return 1
+  fi
+
+  chmod +x "$script_path" 2>/dev/null || true
+  say "Устанавливаю ежедневную безопасную автоочистку Docker..."
+  $SUDO tee "$service_file" >/dev/null <<EOF
+[Unit]
+Description=XNODE Quip safe Docker cleanup
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=$script_path cleanup-auto
+EOF
+
+  $SUDO tee "$timer_file" >/dev/null <<'EOF'
+[Unit]
+Description=Run XNODE Quip safe Docker cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+AccuracySec=30min
+Persistent=true
+Unit=xnode-quip-cleanup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable "$cleanup_timer_name" >/dev/null
+  $SUDO systemctl restart "$cleanup_timer_name"
+  ok "Автоочистка включена: $cleanup_timer_name"
+  soft "Каждый день будет удалять только dangling images и старый build cache. Chain database не трогается."
+  [[ "$quiet" == "yes" ]] || pause
+}
+
+disable_cleanup_timer() {
+  local quiet="${1:-no}"
+  if command -v systemctl >/dev/null 2>&1; then
+    $SUDO systemctl disable --now "$cleanup_timer_name" >/dev/null 2>&1 || true
+    ok "Автоочистка выключена: $cleanup_timer_name"
+  else
+    warn "systemctl не найден, выключать нечего."
+  fi
+  [[ "$quiet" == "yes" ]] || pause
+}
+
+show_cleanup_status() {
+  section "Автоочистка"
+  kv "timer" "$(cleanup_status_line)"
+  kv "next run" "$(cleanup_next_run)"
+  echo
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl status "$cleanup_timer_name" --no-pager 2>/dev/null || true
+  fi
+}
+
+cleanup_center() {
+  need_repo || return
+  while true; do
+    logo
+    disk_report
+    echo
+    show_cleanup_status
+    cat <<EOF
+
+${bold}Очистка и защита диска:${reset}
+1) Безопасная очистка Docker сейчас
+2) Применить лимит Docker logs к Quip контейнерам
+3) Очистить Docker json logs вручную
+4) Включить ежедневную безопасную автоочистку
+5) Выключить автоочистку
+0) Назад
+EOF
+    read -r -p "Выбор: " choice
+    case "$choice" in
+      1) safe_disk_cleanup ;;
+      2) apply_log_limits_to_override "ask"; pause ;;
+      3) truncate_docker_logs ;;
+      4) install_cleanup_timer ;;
+      5) disable_cleanup_timer ;;
+      0) return ;;
+      *) warn "Нет такого пункта."; sleep 1 ;;
+    esac
+  done
 }
 
 diagnostics() {
@@ -1520,6 +1775,8 @@ diagnostics() {
   echo
   say "Resource usage"
   docker_cli stats --no-stream quip-cpu quip-validator quip-dashboard quip-postgres quip-caddy 2>/dev/null || true
+  echo
+  disk_report
   pause
 }
 
@@ -1653,6 +1910,7 @@ ${bold}Меню:${reset}
 10) Проверить / обновить Quip node
 11) Остановить ноду
 12) Автовосстановление miner: статус / вкл / выкл
+13) Очистка диска / лимит логов / автоочистка
 0) Выход
 
 Папка установки: $BASE_DIR
@@ -1671,6 +1929,7 @@ EOF
       10) update_center ;;
       11) stop_node ;;
       12) auto_recover_center ;;
+      13) cleanup_center ;;
       0) exit 0 ;;
       *) warn "Нет такого пункта."; sleep 1 ;;
     esac
@@ -1695,7 +1954,13 @@ case "${1:-menu}" in
   stop) stop_node ;;
   check-updates) check_updates_cli ;;
   update) update_node_cli ;;
+  cleanup) logo; safe_disk_cleanup ;;
+  cleanup-auto) safe_disk_cleanup "yes" ;;
+  cleanup-status) logo; show_cleanup_status ;;
+  cleanup-install) install_cleanup_timer "yes" ;;
+  cleanup-disable) disable_cleanup_timer "yes" ;;
+  log-limits) apply_log_limits_to_override "ask" ;;
   rpc-local) switch_miner_rpc local ;;
   rpc-public) switch_miner_rpc public ;;
-  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|restart|stop|check-updates|update|rpc-local|rpc-public]"; exit 1 ;;
+  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|rpc-local|rpc-public]"; exit 1 ;;
 esac
