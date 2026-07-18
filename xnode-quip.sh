@@ -17,6 +17,10 @@ SUMMARY_FILE="${XNODE_SUMMARY_FILE:-$BASE_DIR/xnode-quip-summary.txt}"
 BACKUP_DIR="${XNODE_BACKUP_DIR:-$BASE_DIR/backups}"
 LOG_MAX_SIZE="${XNODE_LOG_MAX_SIZE:-50m}"
 LOG_MAX_FILE="${XNODE_LOG_MAX_FILE:-3}"
+VALIDATOR_STATE_PRUNING="${XNODE_VALIDATOR_STATE_PRUNING:-1024}"
+VALIDATOR_BLOCKS_PRUNING="${XNODE_VALIDATOR_BLOCKS_PRUNING:-1024}"
+VALIDATOR_DB_CACHE_MB="${XNODE_VALIDATOR_DB_CACHE_MB:-256}"
+VALIDATOR_RESET_THRESHOLD_GB="${XNODE_VALIDATOR_RESET_THRESHOLD_GB:-55}"
 
 MIN_CPU=2
 MIN_RAM_MB=3900
@@ -396,8 +400,11 @@ EOF
 write_config_file() {
   local node_name="$1"
   local cpu_count="$2"
+  local validators="${3:-$PUBLIC_VALIDATORS}"
   local config_file="$REPO_DIR/data/config.toml"
   local backup
+  local validator
+  local -a validator_list
 
   mkdir -p "$REPO_DIR/data"
   if [[ -f "$config_file" ]]; then
@@ -411,18 +418,37 @@ write_config_file() {
 
 [miner]
 validators = [
-    "ws://quip-validator:9944",
+EOF
+  IFS=',' read -ra validator_list <<< "$validators"
+  for validator in "${validator_list[@]}"; do
+    validator="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' <<< "$validator")"
+    [[ -n "$validator" ]] && printf '    "%s",\n' "$validator" >> "$config_file"
+  done
+  cat >> "$config_file" <<EOF
 ]
 signer_key = "/data/keystore.json"
 node_name = "$node_name"
 rest_host = "0.0.0.0"
-rest_port = 80
+rest_port = 8086
 log_level = "INFO"
 node_log = "/data/logs/quip-node.log"
 
 [cpu]
 num_cpus = $cpu_count
 EOF
+}
+
+set_config_validators() {
+  need_repo || return
+  local validators="$1"
+  local config_file="$REPO_DIR/data/config.toml"
+  local node_name cpu_count
+
+  node_name="$(awk -F'"' '/^node_name[[:space:]]*=/ {print $2; exit}' "$config_file" 2>/dev/null || true)"
+  cpu_count="$(awk -F'= *' '/^num_cpus[[:space:]]*=/ {print $2; exit}' "$config_file" 2>/dev/null || true)"
+  node_name="${node_name:-xnode-quip}"
+  cpu_count="${cpu_count:-1}"
+  write_config_file "$node_name" "$cpu_count" "$validators"
 }
 
 write_override_file() {
@@ -453,6 +479,28 @@ EOF
   cat >> "$override_file" <<'EOF'
   quip-validator:
     logging: *xnode-logging
+EOF
+
+  cat >> "$override_file" <<EOF
+    command:
+      - --chain=/etc/quip/chain-spec.json
+      - --base-path=/data
+      - --name=\${VALIDATOR_NAME:-quip-validator}
+      - --validator
+      - --state-pruning=$VALIDATOR_STATE_PRUNING
+      - --blocks-pruning=$VALIDATOR_BLOCKS_PRUNING
+      - --db-cache=$VALIDATOR_DB_CACHE_MB
+      - --rpc-port=9944
+      - --unsafe-rpc-external
+      - --rpc-cors=*
+      - --rpc-methods=safe
+      - --prometheus-port=9615
+      - --prometheus-external
+      - --no-mdns
+      - --unsafe-force-node-key-generation
+EOF
+
+  cat >> "$override_file" <<'EOF'
   dashboard:
     logging: *xnode-logging
   postgres:
@@ -490,6 +538,33 @@ restore_override_file() {
     cp "$backup_file" "$override_file"
   else
     rm -f "$override_file"
+  fi
+}
+
+backup_config_file() {
+  local config_file="$REPO_DIR/data/config.toml"
+  local backup_file
+
+  mkdir -p "$BACKUP_DIR"
+  chmod 700 "$BACKUP_DIR"
+  backup_file="$BACKUP_DIR/config.toml.$(date -u +%Y%m%d-%H%M%S).bak"
+
+  if [[ -f "$config_file" ]]; then
+    cp "$config_file" "$backup_file"
+  else
+    : > "$backup_file"
+  fi
+  echo "$backup_file"
+}
+
+restore_config_file() {
+  local backup_file="$1"
+  local config_file="$REPO_DIR/data/config.toml"
+
+  if [[ -s "$backup_file" ]]; then
+    cp "$backup_file" "$config_file"
+  else
+    rm -f "$config_file"
   fi
 }
 
@@ -1021,7 +1096,7 @@ wait_for_miner() {
 
   say "Жду, пока miner станет is_mining=true..."
   for ((i = 1; i <= attempts; i++)); do
-    if status_json 2>/dev/null | grep -q '"is_mining": true'; then
+    if miner_rest_is_mining; then
       say "Miner запущен и майнит."
       return 0
     fi
@@ -1084,7 +1159,7 @@ recent_miner_errors() {
 switch_miner_rpc() {
   need_repo || return
   local mode="$1"
-  local validators expected backup_file errors
+  local validators expected backup_file config_backup_file errors
 
   case "$mode" in
     local)
@@ -1105,7 +1180,7 @@ switch_miner_rpc() {
   section "Switch Miner RPC"
   kv "mode" "$mode"
   kv "validators" "$validators"
-  warn "Это advanced-режим. Для обычной Quip-ноды официально рекомендуется локальный validator ws://quip-validator:9944."
+  warn "Это advanced-режим. По умолчанию XNODE держит miner на public bootnodes, а локальный validator синхронизирует pruned-базу в фоне."
   warn "Переключение RPC пересоздаёт miner и может временно сломать рабочую ноду."
   read -r -p "Напиши YES чтобы продолжить переключение RPC: " confirm_rpc || true
   if [[ "$confirm_rpc" != "YES" ]]; then
@@ -1120,30 +1195,36 @@ switch_miner_rpc() {
   fi
 
   backup_file="$(backup_override_file)"
+  config_backup_file="$(backup_config_file)"
   say "Backup override: $backup_file"
+  say "Backup config: $config_backup_file"
 
   ACTIVE_VALIDATORS="$validators"
   write_override_file "disabled" "$validators"
+  set_config_validators "$validators"
   say "Override обновлён. Пересоздаю miner..."
 
   if ! restart_cpu_only; then
-    warn "Recreate miner не удался. Возвращаю прежний override."
+    warn "Recreate miner не удался. Возвращаю прежний override/config."
     restore_override_file "$backup_file"
+    restore_config_file "$config_backup_file"
     restart_cpu_only || true
     return 1
   fi
 
   if ! wait_for_miner 48; then
-    warn "Miner не стал is_mining=true. Возвращаю прежний override."
+    warn "Miner не стал is_mining=true. Возвращаю прежний override/config."
     restore_override_file "$backup_file"
+    restore_config_file "$config_backup_file"
     restart_cpu_only || true
     wait_for_miner 24 || true
     return 1
   fi
 
   if [[ -n "$expected" ]] && ! wait_for_rpc_url "$expected" 36; then
-    warn "Переключение RPC не подтвердилось. Возвращаю прежний override."
+    warn "Переключение RPC не подтвердилось. Возвращаю прежний override/config."
     restore_override_file "$backup_file"
+    restore_config_file "$config_backup_file"
     restart_cpu_only || true
     wait_for_miner 24 || true
     return 1
@@ -1155,9 +1236,10 @@ switch_miner_rpc() {
 
   errors="$(recent_miner_errors)"
   if [[ -n "$errors" ]]; then
-    warn "В свежих логах есть критичные строки. Возвращаю прежний override."
+    warn "В свежих логах есть критичные строки. Возвращаю прежний override/config."
     echo "$errors"
     restore_override_file "$backup_file"
+    restore_config_file "$config_backup_file"
     restart_cpu_only || true
     wait_for_miner 24 || true
     return 1
@@ -1173,8 +1255,8 @@ install_node() {
   section "Установка / восстановление Quip CPU node"
   kv "Режим" "CPU miner, GPU не нужен"
   kv "Дашборд" "HTTP на :20049, домен не нужен"
-  kv "RPC miner" "по умолчанию локальный validator ws://quip-validator:9944"
-  kv "Локальный validator" "запускается и синхронизируется в фоне"
+  kv "RPC miner" "по умолчанию public bootnodes, чтобы miner не ждал ресинк локального validator"
+  kv "Локальный validator" "запускается pruned и синхронизируется в фоне"
   kv "Папка установки" "$BASE_DIR"
   kv "Основной repo" "$REPO_DIR"
   kv "Faucet repo" "$FAUCET_DIR"
@@ -1219,13 +1301,13 @@ install_node() {
     backup_keystore_file
   fi
 
-  validators="$LOCAL_VALIDATOR"
-  say "RPC miner: $validators (локальный validator, официальный default)"
+  validators="$PUBLIC_VALIDATORS"
+  say "RPC miner: $validators (public bootnodes, устойчиво при сбросе/ресинке validator)"
   ACTIVE_VALIDATORS="$validators"
 
   section "Шаг 6/8: Конфигурация"
   write_env_file "$node_name" "$cpuset"
-  write_config_file "$node_name" "$cpu_count"
+  write_config_file "$node_name" "$cpu_count" "$validators"
 
   faucet_mode="enabled"
   if [[ "$has_keystore" == "yes" ]]; then
@@ -1439,7 +1521,8 @@ Notes:
   - If QuantumPow.DefaultTopology is missing, the miner account can be funded/registered but mining cannot start until Quip seeds topology on testnet.
   - Auto-recover can keep watching topology/miner health and restart the miner after Quip network updates.
   - Use menu item 10 or ./xnode-quip.sh check-updates to detect Git updates before applying them.
-  - Use menu item 13 or ./xnode-quip.sh cleanup to safely prune old Docker leftovers.
+  - Use menu item 13 or ./xnode-quip.sh cleanup to inspect disk and prune old Docker leftovers.
+  - Use ./xnode-quip.sh validator-reset to recreate only validator DB with pruning when archive DB grows too much.
 EOF
   chmod 600 "$SUMMARY_FILE"
   say "Summary saved: $SUMMARY_FILE"
@@ -1495,6 +1578,7 @@ disk_report() {
   kv "Install dir" "$BASE_DIR"
   kv "Quip repo" "$(dir_size "$REPO_DIR")"
   kv "Validator DB" "$(dir_size "$REPO_DIR/data/validator-data")"
+  kv "Validator pruning" "state=$VALIDATOR_STATE_PRUNING blocks=$VALIDATOR_BLOCKS_PRUNING db-cache=${VALIDATOR_DB_CACHE_MB}MB"
   kv "Miner runtime" "$(dir_size "$REPO_DIR/data/runtime")"
   kv "Quip logs dir" "$(dir_size "$REPO_DIR/data/logs")"
   kv "Docker dir" "$(dir_size /var/lib/docker)"
@@ -1505,7 +1589,24 @@ disk_report() {
   say "Самые крупные Docker json logs"
   largest_docker_logs || true
   echo
-  soft "Важно: validator DB растёт потому что Quip validator запущен как archive node. Это рабочие chain data, их нельзя чистить как мусор."
+  soft "Важно: если validator DB создавался в archive-режиме, обычная Docker-чистка его не уменьшит. Нужен сброс validator DB и запуск с pruning."
+}
+
+path_size_gb() {
+  local path="$1"
+  if [[ -e "$path" ]]; then
+    du -sBG "$path" 2>/dev/null | awk '{gsub("G","",$1); print $1+0}'
+  else
+    echo 0
+  fi
+}
+
+root_free_gb() {
+  df -BG "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2 {gsub("G","",$4); print $4+0}' || echo 0
+}
+
+validator_db_gb() {
+  path_size_gb "$REPO_DIR/data/validator-data"
 }
 
 current_override_validators() {
@@ -1517,7 +1618,7 @@ current_override_validators() {
       value="$(sed -n 's/^[[:space:]]*QUIP_VALIDATORS:[[:space:]]*//p' "$override_file" 2>/dev/null | head -n1 | sed 's/^["'\'']//; s/["'\'']$//')"
     fi
   fi
-  echo "${value:-$LOCAL_VALIDATOR}"
+  echo "${value:-$PUBLIC_VALIDATORS}"
 }
 
 current_faucet_mode() {
@@ -1550,6 +1651,105 @@ apply_log_limits_to_override() {
   wait_for_miner 24 || true
 }
 
+apply_pruned_validator_override() {
+  need_repo || return
+  local validators faucet_mode recreate="${1:-ask}"
+  validators="$(current_override_validators)"
+  faucet_mode="$(current_faucet_mode)"
+
+  backup_override_file >/dev/null || true
+  write_override_file "$faucet_mode" "$validators"
+  ok "Override записан: validator pruning state=$VALIDATOR_STATE_PRUNING blocks=$VALIDATOR_BLOCKS_PRUNING db-cache=${VALIDATOR_DB_CACHE_MB}MB"
+
+  warn "Если текущая validator DB была создана как archive, один override не поможет: Substrate хранит pruning mode внутри DB."
+  warn "Для применения pruning к старой archive DB нужен пункт сброса validator DB."
+
+  if [[ "$recreate" == "ask" ]]; then
+    read -r -p "Пересоздать stack сейчас без удаления DB? [y/N]: " do_recreate || true
+    [[ "$do_recreate" =~ ^[Yy]$ ]] || return 0
+  fi
+
+  compose up -d
+}
+
+wait_for_validator_container() {
+  local attempts="${1:-60}"
+  local i status restarts
+
+  say "Жду, пока quip-validator запустится без crash-loop..."
+  for ((i = 1; i <= attempts; i++)); do
+    status="$(docker_cli inspect --format '{{.State.Status}}' quip-validator 2>/dev/null || echo missing)"
+    restarts="$(docker_cli inspect --format '{{.RestartCount}}' quip-validator 2>/dev/null || echo 0)"
+    if [[ "$status" == "running" ]]; then
+      sleep 3
+      status="$(docker_cli inspect --format '{{.State.Status}}' quip-validator 2>/dev/null || echo missing)"
+      if [[ "$status" == "running" ]]; then
+        ok "quip-validator running, restarts=$restarts"
+        return 0
+      fi
+    fi
+    if (( i % 6 == 0 )); then
+      echo "  validator status=$status restarts=$restarts ($i/$attempts)"
+    fi
+    sleep 5
+  done
+
+  warn "Validator не стал стабильным за отведённое время."
+  docker_cli logs --tail=120 quip-validator 2>&1 || true
+  return 1
+}
+
+reset_validator_db_pruned() {
+  need_repo || return
+  local quiet="${1:-no}"
+  local validator_dir="$REPO_DIR/data/validator-data"
+  local before_size validators faucet_mode
+
+  if [[ "$validator_dir" != "$REPO_DIR"/data/validator-data ]]; then
+    fail "Safety check failed for validator dir: $validator_dir"
+    return 1
+  fi
+
+  before_size="$(dir_size "$validator_dir")"
+  section "Сброс validator DB с pruning"
+  warn "Будет удалена только локальная validator chain database: $validator_dir"
+  warn "Keystore майнера НЕ трогаю: $REPO_DIR/data/keystore.json"
+  warn "После сброса validator начнёт синхронизацию заново, но база больше не будет archive."
+  kv "Текущий размер" "$before_size"
+  kv "Новый pruning" "state=$VALIDATOR_STATE_PRUNING blocks=$VALIDATOR_BLOCKS_PRUNING db-cache=${VALIDATOR_DB_CACHE_MB}MB"
+
+  if [[ "$quiet" != "yes" ]]; then
+    read -r -p "Напиши YES чтобы удалить validator DB и пересоздать её: " confirm || true
+    if [[ "$confirm" != "YES" ]]; then
+      warn "Сброс validator DB отменён."
+      pause
+      return 0
+    fi
+  fi
+
+  validators="$(current_override_validators)"
+  faucet_mode="$(current_faucet_mode)"
+  backup_override_file >/dev/null || true
+  write_override_file "$faucet_mode" "$validators"
+
+  say "Останавливаю validator/dashboard/caddy..."
+  compose stop quip-validator dashboard caddy >/dev/null 2>&1 || true
+  docker_cli rm -f quip-validator >/dev/null 2>&1 || true
+
+  say "Удаляю старую validator DB ($before_size)..."
+  rm -rf --one-file-system "$validator_dir"
+  mkdir -p "$validator_dir"
+
+  say "Запускаю stack с pruned validator..."
+  compose up -d
+  wait_for_validator_container 60 || true
+
+  echo
+  ok "Validator DB пересоздана. Было: $before_size, стало: $(dir_size "$validator_dir")"
+  kv "Root disk" "$(df -h "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2 {print $3 " used / " $4 " free / " $5}')"
+  [[ "$quiet" == "yes" ]] || pause
+}
+
 safe_disk_cleanup() {
   need_repo || return
   local quiet="${1:-no}"
@@ -1572,6 +1772,24 @@ safe_disk_cleanup() {
   say "После очистки"
   docker_cli system df 2>/dev/null || true
   [[ "$quiet" == "yes" ]] || pause
+}
+
+storage_guard_auto() {
+  need_repo || return
+  local size_gb free_gb
+
+  safe_disk_cleanup "yes"
+  size_gb="$(validator_db_gb)"
+  free_gb="$(root_free_gb)"
+
+  echo
+  say "Storage guard: validator_db=${size_gb}G, root_free=${free_gb}G, threshold=${VALIDATOR_RESET_THRESHOLD_GB}G"
+  if (( size_gb >= VALIDATOR_RESET_THRESHOLD_GB || free_gb < 12 )); then
+    warn "Validator DB слишком большая или свободного места мало. Запускаю автоматический сброс validator DB."
+    reset_validator_db_pruned "yes"
+  else
+    ok "Сброс validator DB не нужен."
+  fi
 }
 
 truncate_docker_logs() {
@@ -1620,10 +1838,10 @@ install_cleanup_timer() {
   fi
 
   chmod +x "$script_path" 2>/dev/null || true
-  say "Устанавливаю ежедневную безопасную автоочистку Docker..."
+  say "Устанавливаю ежедневную автоочистку и storage guard..."
   $SUDO tee "$service_file" >/dev/null <<EOF
 [Unit]
-Description=XNODE Quip safe Docker cleanup
+Description=XNODE Quip safe storage cleanup and validator DB guard
 After=docker.service
 
 [Service]
@@ -1634,7 +1852,7 @@ EOF
 
   $SUDO tee "$timer_file" >/dev/null <<'EOF'
 [Unit]
-Description=Run XNODE Quip safe Docker cleanup daily
+Description=Run XNODE Quip storage cleanup daily
 
 [Timer]
 OnCalendar=*-*-* 04:15:00
@@ -1650,7 +1868,7 @@ EOF
   $SUDO systemctl enable "$cleanup_timer_name" >/dev/null
   $SUDO systemctl restart "$cleanup_timer_name"
   ok "Автоочистка включена: $cleanup_timer_name"
-  soft "Каждый день будет удалять только dangling images и старый build cache. Chain database не трогается."
+  soft "Каждый день чистятся Docker leftovers. Если validator DB превысит ${VALIDATOR_RESET_THRESHOLD_GB}G или места станет меньше 12G, она будет пересоздана с pruning."
   [[ "$quiet" == "yes" ]] || pause
 }
 
@@ -1686,19 +1904,23 @@ cleanup_center() {
 
 ${bold}Очистка и защита диска:${reset}
 1) Безопасная очистка Docker сейчас
-2) Применить лимит Docker logs к Quip контейнерам
+2) Применить лимит Docker logs + pruned validator override
 3) Очистить Docker json logs вручную
-4) Включить ежедневную безопасную автоочистку
-5) Выключить автоочистку
+4) Сбросить validator DB и пересоздать с pruning
+5) Запустить автоочистку + storage guard сейчас
+6) Включить ежедневную автоочистку + storage guard
+7) Выключить автоочистку
 0) Назад
 EOF
     read -r -p "Выбор: " choice
     case "$choice" in
       1) safe_disk_cleanup ;;
-      2) apply_log_limits_to_override "ask"; pause ;;
+      2) apply_pruned_validator_override "ask"; pause ;;
       3) truncate_docker_logs ;;
-      4) install_cleanup_timer ;;
-      5) disable_cleanup_timer ;;
+      4) reset_validator_db_pruned ;;
+      5) storage_guard_auto; pause ;;
+      6) install_cleanup_timer ;;
+      7) disable_cleanup_timer ;;
       0) return ;;
       *) warn "Нет такого пункта."; sleep 1 ;;
     esac
@@ -1955,12 +2177,15 @@ case "${1:-menu}" in
   check-updates) check_updates_cli ;;
   update) update_node_cli ;;
   cleanup) logo; safe_disk_cleanup ;;
-  cleanup-auto) safe_disk_cleanup "yes" ;;
+  cleanup-auto) storage_guard_auto ;;
   cleanup-status) logo; show_cleanup_status ;;
   cleanup-install) install_cleanup_timer "yes" ;;
   cleanup-disable) disable_cleanup_timer "yes" ;;
   log-limits) apply_log_limits_to_override "ask" ;;
+  storage-guard) logo; storage_guard_auto ;;
+  validator-prune-override) apply_pruned_validator_override "ask" ;;
+  validator-reset) logo; reset_validator_db_pruned ;;
   rpc-local) switch_miner_rpc local ;;
   rpc-public) switch_miner_rpc public ;;
-  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|rpc-local|rpc-public]"; exit 1 ;;
+  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|storage-guard|validator-prune-override|validator-reset|rpc-local|rpc-public]"; exit 1 ;;
 esac

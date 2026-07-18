@@ -2,7 +2,7 @@
 
 Russian-first installer and maintenance menu for a Quip Network testnet CPU node.
 
-The script installs the official Quip Docker Compose stack, prepares a CPU miner configuration, starts the dashboard without a domain, and provides a menu for logs, diagnostics, wallet backup, updates, and optional miner auto-recovery.
+The script installs the official Quip Docker Compose stack, prepares a CPU miner configuration, starts the dashboard without a domain, and provides a menu for logs, diagnostics, wallet backup, updates, disk protection, and optional miner auto-recovery.
 
 ## Quick Install
 
@@ -68,6 +68,14 @@ Safe Docker cleanup and disk report:
 ./xnode-quip.sh cleanup-install
 ```
 
+Storage guard and validator database maintenance:
+
+```bash
+./xnode-quip.sh storage-guard
+./xnode-quip.sh validator-reset
+./xnode-quip.sh validator-prune-override
+```
+
 Manage miner auto-recovery:
 
 ```bash
@@ -94,7 +102,9 @@ Recommended:
 
 GPU is not required. The installer uses the Quip CPU profile.
 
-Note: the bundled Quip validator runs as an archive node, so `data/validator-data` can grow significantly over time. The cleanup command prunes only safe Docker leftovers and does not delete validator chain data, Postgres volumes, or `keystore.json`.
+Note: the installer runs the bundled Quip validator with pruning by default to prevent unbounded archive database growth. If an old archive database already exists, use `./xnode-quip.sh validator-reset` to delete only `data/validator-data` and recreate it with pruning. This does not delete the miner wallet `data/keystore.json`.
+
+The daily cleanup timer installed by `./xnode-quip.sh cleanup-install` safely prunes Docker leftovers and runs a storage guard. If the validator database crosses the configured threshold, the guard can recreate only the validator database with pruning while preserving the miner wallet.
 
 ## Security Notes
 
