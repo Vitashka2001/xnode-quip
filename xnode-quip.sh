@@ -44,6 +44,10 @@ HEALTH_STATE_FILE="${XNODE_HEALTH_STATE_FILE:-$BASE_DIR/health-state.json}"
 STALL_SECONDS="${XNODE_STALL_SECONDS:-900}"
 # Minimum gap between recovery attempts, widened on repeats (see below).
 STALL_COOLDOWN_SECONDS="${XNODE_STALL_COOLDOWN_SECONDS:-900}"
+# The validator gets a longer rope than the miner: a restart costs it a
+# startup and a chunk of resync, and normal full sync can pause on a slow
+# peer without being wedged.
+VALIDATOR_STALL_SECONDS="${XNODE_VALIDATOR_STALL_SECONDS:-1800}"
 LOG_MAX_SIZE="${XNODE_LOG_MAX_SIZE:-50m}"
 LOG_MAX_FILE="${XNODE_LOG_MAX_FILE:-3}"
 VALIDATOR_STATE_PRUNING="${XNODE_VALIDATOR_STATE_PRUNING:-1024}"
@@ -389,6 +393,26 @@ default_cpuset() {
   echo "0-$last"
 }
 
+# Upstream caps the miner at QUIP_MINER_MEM_LIMIT, default 16g, to stop a
+# runaway miner from triggering a host-wide OOM. On any box with less than
+# 16 GB that default is above total RAM, so the cap never binds and the
+# protection is silently off — which is how this node ended up with the kernel
+# OOM-killing the *validator* ten times in 26 hours, it being the largest RSS
+# on the box. Size the cap from the host instead, leaving room for the
+# validator (~3.5G), the dashboard (~1.2G) and postgres/caddy/OS (~1G).
+default_miner_mem_limit() {
+  local total_mb limit_mb
+  total_mb="$(system_ram_mb)"
+  if ! [[ "$total_mb" =~ ^[0-9]+$ ]] || (( total_mb <= 0 )); then
+    echo "2g"
+    return
+  fi
+  limit_mb=$(( total_mb - 5700 ))
+  (( limit_mb < 1024 )) && limit_mb=1024
+  (( limit_mb > 16384 )) && limit_mb=16384
+  echo "${limit_mb}m"
+}
+
 sanitize_name() {
   local raw="$1"
   raw="${raw:-xnode-quip}"
@@ -424,6 +448,9 @@ PGID=0
 #   QUIP_VALIDATOR_TAG=v0.2.2-rc4
 #   QUIP_FAUCET_TAG=latest
 QUIP_MINER_CPUSET=$cpuset
+# Sized from this host's RAM. The compose default (16g) is above total memory
+# on a smaller box, which turns the cap off exactly where it matters.
+QUIP_MINER_MEM_LIMIT=$(default_miner_mem_limit)
 VALIDATOR_NAME=$node_name-validator
 SUBSTRATE_BOOTNODES=
 POSTGRES_DB=quip
@@ -648,6 +675,20 @@ migrate_override_file() {
   say "Backup override: $(backup_override_file)"
   write_override_file
   ok "docker-compose.override.yml переписан без мёртвых QUIP_* env."
+}
+
+# An .env written before the cap was sized has no QUIP_MINER_MEM_LIMIT at all,
+# so compose falls back to its 16g default.
+migrate_env_mem_limit() {
+  local env_file="$REPO_DIR/.env"
+  local limit
+
+  [[ -f "$env_file" ]] || return 0
+  grep -Eq '^[[:space:]]*QUIP_MINER_MEM_LIMIT[[:space:]]*=' "$env_file" && return 0
+
+  limit="$(default_miner_mem_limit)"
+  printf '\n# Added by XNODE: compose defaults to 16g, which is above total RAM on a\n# smaller host and therefore never binds.\nQUIP_MINER_MEM_LIMIT=%s\n' "$limit" >> "$env_file"
+  ok "В .env добавлен QUIP_MINER_MEM_LIMIT=$limit (RAM хоста: $(system_ram_mb) MB)."
 }
 
 migrate_env_tags() {
@@ -1067,6 +1108,12 @@ except Exception:
     sys.exit(1)'
 }
 
+# Best block the colocated validator has imported. Empty when its RPC does not
+# answer — which is itself one of the shapes the stall takes.
+validator_head_number() {
+  chain_head_number "$LOCAL_VALIDATOR"
+}
+
 # Reference head for the "is the chain itself alive?" guard. Public bootnodes
 # first; the colocated validator is the fallback, and it is only a fallback
 # because a resyncing validator reports its own catch-up height, not the tip.
@@ -1310,6 +1357,131 @@ miner_stall_check() {
   return 1
 }
 
+# --- Validator stall watchdog ----------------------------------------------
+#
+# The colocated validator fails the same way and just as silently. On this host
+# it stopped at block #942302 with the RPC still listening but never answering,
+# logging "Timeout while trying to acquire a write lock for the shared trie
+# cache" ~170 times while reporting "Syncing 0.0 bps". Before that the kernel
+# had been OOM-killing it every few hours (10 kills in 26 hours, always the
+# largest RSS on the box). The miner rides public bootnodes by design, so none
+# of this stops mining — it just leaves the dashboard's chain view frozen and a
+# CPU core burning on a node that will never catch up.
+
+# Head of the public chain only. reference_head_number() falls back to the local
+# validator, which would have the validator grading its own homework.
+public_head_number() {
+  chain_head_number "$PUBLIC_RPC"
+}
+
+# Returns 0 healthy/skipped, 1 stalled (action taken), 2 undetermined.
+validator_stall_check() {
+  local mode="${1:-act}"
+  local now head reference prev_head prev_reference
+  local last_progress last_action actions stalled_for cooldown
+
+  # Nothing to judge unless the container is supposed to be up. A validator the
+  # operator stopped deliberately must stay stopped.
+  [[ "$(docker_cli inspect -f '{{.State.Status}}' quip-validator 2>/dev/null || echo missing)" == "running" ]] || return 0
+
+  now="$(date -u +%s)"
+  reference="$(public_head_number 2>/dev/null || true)"
+  if [[ -z "$reference" ]]; then
+    [[ "$mode" == "report" ]] && warn "Validator: публичный RPC не ответил, оценка невозможна."
+    return 2
+  fi
+
+  head="$(validator_head_number 2>/dev/null || true)"
+  prev_head="$(health_state_get validator_head)"
+  prev_reference="$(health_state_get validator_reference)"
+  last_progress="$(health_state_get validator_progress_at)"
+  last_action="$(health_state_get validator_action_at)"
+  actions="$(health_state_get validator_actions)"
+  [[ "$last_progress" =~ ^[0-9]+$ ]] || last_progress=0
+  [[ "$last_action" =~ ^[0-9]+$ ]] || last_action=0
+  [[ "$actions" =~ ^[0-9]+$ ]] || actions=0
+
+  if (( last_progress == 0 )); then
+    if [[ "$mode" == "report" ]]; then
+      soft "Validator: базовой точки ещё нет."
+      return 0
+    fi
+    health_state_put "validator_head=${head:-0}" "validator_reference=$reference" \
+      "validator_progress_at=$now" "validator_action_at=0" "validator_actions=0"
+    return 0
+  fi
+
+  # Substrate resumes from its on-disk head after a restart, so unlike the
+  # miner's counters this number does not reset to zero — but a database reset
+  # does move it backwards, and that is a rebaseline, not a stall.
+  if [[ -n "$head" ]] && [[ "$prev_head" =~ ^[0-9]+$ ]] && (( head < prev_head )); then
+    [[ "$mode" == "report" ]] || health_state_put "validator_head=$head" \
+      "validator_reference=$reference" "validator_progress_at=$now"
+    say "Validator: head пошёл назад ($prev_head -> $head), база сброшена. Обновляю точку отсчёта."
+    return 0
+  fi
+
+  if [[ -n "$head" ]] && (( head > ${prev_head:-0} )); then
+    if [[ "$mode" == "report" ]]; then
+      ok "Validator: синхронизируется (best=$head, сеть=$reference, отставание $(( reference - head )))."
+    else
+      health_state_put "validator_head=$head" "validator_reference=$reference" \
+        "validator_progress_at=$now" "validator_actions=0"
+    fi
+    return 0
+  fi
+
+  if [[ "$prev_reference" =~ ^[0-9]+$ ]] && (( reference <= prev_reference )); then
+    [[ "$mode" == "report" ]] || health_state_put "validator_reference=$reference"
+    warn "Validator: chain head не растёт — проблема на стороне сети, validator не трогаю."
+    return 2
+  fi
+
+  [[ "$mode" == "report" ]] || health_state_put "validator_reference=$reference"
+  stalled_for=$(( now - last_progress ))
+
+  if (( stalled_for < VALIDATOR_STALL_SECONDS )); then
+    if [[ "$mode" == "report" ]]; then
+      warn "Validator: прогресса нет $stalled_for с (порог $VALIDATOR_STALL_SECONDS с)."
+    fi
+    return 0
+  fi
+
+  if [[ "$mode" == "report" ]]; then
+    bad "Validator: завис на $stalled_for с (best=${head:-нет ответа}, сеть=$reference)."
+    return 1
+  fi
+
+  cooldown=$(( STALL_COOLDOWN_SECONDS * ( actions < 4 ? actions + 1 : 4 ) ))
+  if (( now - last_action < cooldown )); then
+    warn "Validator: застой подтверждён, cooldown ещё не вышел ($(( now - last_action ))/$cooldown с)."
+    return 1
+  fi
+
+  actions=$(( actions + 1 ))
+  bad "Validator: застой $stalled_for с при живой chain (сеть=$reference). Восстановление, попытка $actions."
+  docker_cli logs --tail 15 quip-validator 2>&1 | tail -10
+
+  if (( actions == 1 )); then
+    say "Уровень 1: перезапускаю validator."
+    compose restart quip-validator
+  elif (( actions == 2 )); then
+    say "Уровень 2: пересоздаю validator."
+    compose up -d --force-recreate --no-deps quip-validator
+  else
+    # Deliberately not automatic: recreating the database throws away hours of
+    # sync, and a validator that will not run after two restarts usually means
+    # a corrupt database or a host problem the operator needs to see.
+    warn "Validator не поднимается после $actions попыток. Дальше нужен ручной шаг:"
+    warn "  ./xnode-quip.sh validator-reset   # пересоздаёт ТОЛЬКО validator DB, keystore не трогает"
+    health_state_put "validator_action_at=$now" "validator_actions=$actions"
+    return 1
+  fi
+
+  health_state_put "validator_action_at=$now" "validator_progress_at=$now" "validator_actions=$actions"
+  return 1
+}
+
 show_health_status() {
   need_repo || return
   local sample head heads results uptime reference last_progress actions now stalled_for
@@ -1349,6 +1521,17 @@ show_health_status() {
   kv "Рестартов подряд" "$actions"
   echo
   miner_stall_check report || true
+
+  section "Watchdog: живость validator"
+  local vhead vactions
+  vhead="$(validator_head_number 2>/dev/null || true)"
+  vactions="$(health_state_get validator_actions)"
+  [[ "$vactions" =~ ^[0-9]+$ ]] || vactions=0
+  kv "Порог застоя" "$VALIDATOR_STALL_SECONDS с"
+  kv "Validator best" "${vhead:-RPC не отвечает}"
+  kv "Рестартов подряд" "$vactions"
+  echo
+  validator_stall_check report || true
 }
 
 auto_recover_service_name="xnode-quip-auto-recover.service"
@@ -1415,6 +1598,7 @@ auto_recover_once() {
     # stayed up and kept reporting is_mining=true — so judge it on forward
     # progress instead.
     miner_stall_check act || true
+    validator_stall_check act || true
     return 0
   fi
 
@@ -2675,6 +2859,7 @@ restart_node() {
     fi
   fi
   migrate_env_tags
+  migrate_env_mem_limit
   migrate_config_v03 || warn "Миграция config.toml не удалась, проверь data/config.toml вручную."
   migrate_override_file
 
@@ -2729,6 +2914,7 @@ update_node() {
   # config has to be on the v0.3 schema before `compose up`.
   section "Миграция конфигурации"
   migrate_env_tags
+  migrate_env_mem_limit
   # Order matters here too: migrate_config_v03 reads the override's legacy
   # faucet marker, so the override is rewritten only afterwards.
   migrate_config_v03 || warn "Миграция config.toml не удалась, проверь data/config.toml вручную."

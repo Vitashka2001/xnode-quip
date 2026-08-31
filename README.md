@@ -157,8 +157,26 @@ Tuning, if the defaults do not suit a host:
 
 | variable | default | meaning |
 |---|---|---|
-| `XNODE_STALL_SECONDS` | `900` | flat counters for this long counts as a stall |
+| `XNODE_STALL_SECONDS` | `900` | miner counters flat this long counts as a stall |
+| `XNODE_VALIDATOR_STALL_SECONDS` | `1800` | validator best block flat this long counts as a stall |
 | `XNODE_STALL_COOLDOWN_SECONDS` | `900` | base gap between recovery attempts |
+
+The validator is watched too, on the same principle and a longer threshold. It
+fails the same silent way — on the node this was developed against it froze at
+one block with its RPC still listening, logging `Timeout while trying to
+acquire a write lock for the shared trie cache` and `Syncing 0.0 bps` while the
+container stayed `Up`. Because the miner uses public bootnodes, mining kept
+working and nothing surfaced it. After two failed restarts the watchdog stops
+and points at `./xnode-quip.sh validator-reset` instead of deleting the
+database itself.
+
+### Memory
+
+The installer writes `QUIP_MINER_MEM_LIMIT` into `.env`, sized from host RAM.
+Upstream caps the miner so a runaway cannot trigger a host-wide OOM, but its
+`16g` default sits above total memory on a smaller box, so the cap never binds.
+With it off, the kernel picks its own victim — on an 8 GB host that meant the
+validator, OOM-killed ten times in 26 hours for being the largest process.
 
 Turn it off with `./xnode-quip.sh auto-recover-disable`.
 

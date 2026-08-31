@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.03
+
+Extends the watchdog to the colocated validator, and fixes a memory cap that
+was never in effect.
+
+The validator fails the same silent way the miner does. On the node this was
+developed against it stopped at block #942302 with its RPC still listening but
+never answering, logging `Timeout while trying to acquire a write lock for the
+shared trie cache` about 170 times while reporting `Syncing 0.0 bps`. The
+container stayed `Up` and a CPU core stayed busy on a node that would never
+catch up. Mining was unaffected — the miner rides public bootnodes by design —
+so nothing surfaced the failure.
+
+- Added a validator watchdog on the same forward-progress principle: the best
+  block it has imported must advance, judged against the public chain head, on
+  a 30-minute threshold (`XNODE_VALIDATOR_STALL_SECONDS`). A longer rope than
+  the miner's, because a restart costs it a startup and a slice of resync.
+- A validator head moving *backwards* is a database reset, not a stall, and
+  rebaselines. Unlike the miner's counters it does not reset on restart, since
+  substrate resumes from its on-disk head.
+- Recovery restarts the validator, then recreates it, and then stops and points
+  at `./xnode-quip.sh validator-reset` rather than deleting the database on its
+  own. Throwing away hours of sync is the operator's call.
+- `QUIP_MINER_MEM_LIMIT` is now sized from host RAM. Upstream caps the miner to
+  keep a runaway from triggering a host-wide OOM, but its 16g default is above
+  total memory on any smaller box, so the cap never binds and the protection is
+  silently off. On the node this was written for that left the kernel free to
+  pick its own victim: it OOM-killed the *validator* ten times in 26 hours,
+  it being the largest RSS on an 8 GB host, plus the dashboard four times.
+  Existing installs get the variable added on update.
+
 ## 1.02
 
 Stall watchdog. The node was observed running for days with a live container,
