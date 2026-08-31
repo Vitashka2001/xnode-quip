@@ -11,6 +11,27 @@ PUBLIC_VALIDATORS="wss://bootnode-2.testnet.quip.network:20049/rpc,wss://bootnod
 LOCAL_VALIDATOR="ws://quip-validator:9944"
 ACTIVE_VALIDATORS="$PUBLIC_VALIDATORS"
 FAUCET_URL="https://faucet.testnet.quip.network"
+PUBLIC_RPC="wss://bootnode-2.testnet.quip.network:20049/rpc"
+# Caddy publishes the local validator's JSON-RPC on the same host port as the
+# dashboard (see caddy/Caddyfile `handle /rpc`), so the host reaches it without
+# a container exec.
+LOCAL_RPC_HTTP="http://localhost:20049/rpc"
+# Port the coordinator's [dashboard] section binds. Must match the
+# `reverse_proxy quip-miner:8086` in caddy/Caddyfile or /api/v1/* 502s.
+MINER_REST_PORT="${XNODE_MINER_REST_PORT:-8086}"
+# Advertised front door written to [miner].public_port. The v0.3 coordinator
+# refuses to start without public_host/public_port, and 20049 is the port this
+# installer opens and puts Caddy on.
+MINER_PUBLIC_PORT="${XNODE_MINER_PUBLIC_PORT:-20049}"
+# Substrate storage keys, twox128(pallet) ++ twox128(item). Precomputed so the
+# chain queries below need nothing but curl + python3 stdlib — the v0.3 miner
+# image dropped the Python substrate client the old queries ran inside.
+SK_DEFAULT_TOPOLOGY="0x9b2c4dbe49d7a1aed7ce99e4b8c072e8a4bccd2391f1245103331f3189ad079f"
+# Map prefix; counting its keys says whether anything is registered at all.
+SK_REGISTERED_TOPOLOGIES="0x9b2c4dbe49d7a1aed7ce99e4b8c072e869e36f224eee7745986b1399492ef513"
+# Map prefixes; the key is prefix ++ blake2_128(account) ++ account.
+SK_MINERS_PREFIX="9b2c4dbe49d7a1aed7ce99e4b8c072e83c8312b14d47df66cbccdda7f2601ff7"
+SK_SYSTEM_ACCOUNT_PREFIX="26aa394eea5630e07c48ae0c9558cef7b99d880ec681799c0cf30e8886371da9"
 PUBLIC_IP_URL="https://api.ipify.org"
 CHECK_PORT_URL="https://check.quip.network/checkport?port="
 SUMMARY_FILE="${XNODE_SUMMARY_FILE:-$BASE_DIR/xnode-quip-summary.txt}"
@@ -384,10 +405,16 @@ write_env_file() {
 QUIP_HOSTNAME=:20049
 PUID=0
 PGID=0
-QUIP_MINER_TAG=v0.2
-QUIP_DASHBOARD_TAG=v0.2
-QUIP_VALIDATOR_TAG=v0.2
-QUIP_FAUCET_TAG=latest
+# Image tags are deliberately NOT pinned here. Upstream moved the miner to the
+# v0.3 repository line (quip-miner/v0.3/quip-miner) and made :latest the
+# compose default for every quip image; a leftover QUIP_MINER_TAG=v0.2 pin
+# resolves to a tag that does not exist on that path and fails the pull with
+# "not found". Every service sets pull_policy: always, so an unpinned stack
+# re-resolves :latest on every up. Pin one of these only to freeze a deploy:
+#   QUIP_MINER_TAG=v0.3.1-rc2
+#   QUIP_DASHBOARD_TAG=v0.2.1
+#   QUIP_VALIDATOR_TAG=v0.2.2-rc4
+#   QUIP_FAUCET_TAG=latest
 QUIP_MINER_CPUSET=$cpuset
 VALIDATOR_NAME=$node_name-validator
 SUBSTRATE_BOOTNODES=
@@ -397,16 +424,115 @@ POSTGRES_PASSWORD=quip
 EOF
 }
 
+# Read one scalar (or comma-joined array) out of data/config.toml.
+#   config_read <table> <key>
+# tomllib needs python3.11+; the regex fallback covers older hosts and is good
+# enough for the flat file this installer writes.
+config_read() {
+  local table="$1" key="$2"
+  local config_file="$REPO_DIR/data/config.toml"
+  [[ -f "$config_file" ]] || return 0
+  python3 - "$config_file" "$table" "$key" <<'PY'
+import re, sys
+
+path, table, key = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def emit(value):
+    if value is None:
+        return
+    if isinstance(value, (list, tuple)):
+        print(",".join(str(v) for v in value))
+    elif isinstance(value, bool):
+        print("true" if value else "false")
+    else:
+        print(value)
+
+try:
+    import tomllib
+    with open(path, "rb") as fh:
+        emit(tomllib.load(fh).get(table, {}).get(key))
+    sys.exit(0)
+except ImportError:
+    pass
+except Exception:
+    sys.exit(0)
+
+# Fallback: walk the file, tracking the current table header.
+text = open(path, "r", encoding="utf-8", errors="replace").read()
+current, buf, found = None, None, None
+for raw in text.splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    if buf is not None:
+        buf += " " + line
+        if "]" in line:
+            found = buf
+            break
+        continue
+    header = re.match(r"^\[([^\]]+)\]$", line)
+    if header:
+        current = header.group(1)
+        continue
+    if current != table:
+        continue
+    match = re.match(r"^%s\s*=\s*(.*)$" % re.escape(key), line)
+    if not match:
+        continue
+    value = match.group(1)
+    if value.startswith("[") and "]" not in value:
+        buf = value
+        continue
+    found = value
+    break
+
+if found is None:
+    sys.exit(0)
+found = found.strip()
+if found.startswith("["):
+    emit(re.findall(r'"([^"]*)"', found))
+else:
+    emit(found.strip().strip('"').strip("'"))
+PY
+}
+
+# [miner].public_host is mandatory in v0.3 and an empty string is rejected, so
+# reuse whatever is already configured before falling back to detection.
+config_public_host() {
+  local host
+  host="$(config_read miner public_host 2>/dev/null || true)"
+  host="${host//[[:space:]]/}"
+  if [[ -z "$host" ]]; then
+    host="$(public_ip 2>/dev/null || true)"
+    host="${host//[[:space:]]/}"
+  fi
+  if [[ -z "$host" ]]; then
+    host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  fi
+  echo "$host"
+}
+
 write_config_file() {
   local node_name="$1"
   local cpu_count="$2"
   local validators="${3:-$PUBLIC_VALIDATORS}"
+  local faucet_mode="${4:-enabled}"
   local config_file="$REPO_DIR/data/config.toml"
-  local backup
+  local backup faucet_url public_host
   local validator
   local -a validator_list
 
   mkdir -p "$REPO_DIR/data"
+  public_host="$(config_public_host)"
+  if [[ -z "$public_host" ]]; then
+    fail "Не удалось определить public_host, а v0.3 coordinator без него не стартует."
+    fail "Задай его вручную в $config_file или экспортируй XNODE_PUBLIC_HOST."
+    return 1
+  fi
+
+  faucet_url="$FAUCET_URL"
+  [[ "$faucet_mode" == "disabled" ]] && faucet_url=""
+
   if [[ -f "$config_file" ]]; then
     backup="$config_file.xnode-backup-$(date -u +%Y%m%d-%H%M%S)"
     cp "$config_file" "$backup"
@@ -414,7 +540,10 @@ write_config_file() {
   fi
 
   cat > "$config_file" <<EOF
-# Quip miner v0.2 CPU configuration, written by XNODE.
+# quip-coordinator v0.3 CPU configuration, written by XNODE.
+# Schema notes: [miner].public_host/public_port are mandatory, the old
+# rest_host/rest_port pair is gone (the REST surface moved to [dashboard]),
+# and at least one backend section must be present.
 
 [miner]
 validators = [
@@ -428,32 +557,109 @@ EOF
 ]
 signer_key = "/data/keystore.json"
 node_name = "$node_name"
-rest_host = "0.0.0.0"
-rest_port = 8086
-log_level = "INFO"
-node_log = "/data/logs/quip-node.log"
+# Empty disables auto-funding; the coordinator refuses to start on an
+# underfunded account when it has no faucet to ask.
+faucet_url = "$faucet_url"
+# Address peers use to reach this node. Required, and "" is not a host.
+public_host = "$public_host"
+public_port = $MINER_PUBLIC_PORT
 
 [cpu]
+# Bundled miner binary; quip-cpu-gibbs is the other choice.
+binary = "quip-cpu-sa"
 num_cpus = $cpu_count
+
+# Miner telemetry + /api/v1/* REST. The port must match the
+# reverse_proxy quip-miner:8086 line in caddy/Caddyfile.
+[dashboard]
+listen = "0.0.0.0:$MINER_REST_PORT"
+data_dir = "/data/attempts"
 EOF
+}
+
+# Rewrite config.toml keeping every value the installer manages, changing only
+# what the caller passes. Both setters below funnel through this.
+rewrite_config_file() {
+  local validators="$1" faucet_mode="$2"
+  local node_name cpu_count
+
+  node_name="$(config_read miner node_name 2>/dev/null || true)"
+  cpu_count="$(config_read cpu num_cpus 2>/dev/null || true)"
+  node_name="${node_name:-xnode-quip}"
+  [[ "$cpu_count" =~ ^[0-9]+$ ]] || cpu_count=1
+  write_config_file "$node_name" "$cpu_count" "$validators" "$faucet_mode"
 }
 
 set_config_validators() {
   need_repo || return
-  local validators="$1"
-  local config_file="$REPO_DIR/data/config.toml"
-  local node_name cpu_count
-
-  node_name="$(awk -F'"' '/^node_name[[:space:]]*=/ {print $2; exit}' "$config_file" 2>/dev/null || true)"
-  cpu_count="$(awk -F'= *' '/^num_cpus[[:space:]]*=/ {print $2; exit}' "$config_file" 2>/dev/null || true)"
-  node_name="${node_name:-xnode-quip}"
-  cpu_count="${cpu_count:-1}"
-  write_config_file "$node_name" "$cpu_count" "$validators"
+  rewrite_config_file "$1" "$(current_faucet_mode)"
 }
 
+set_config_faucet() {
+  need_repo || return
+  rewrite_config_file "$(current_config_validators)" "$1"
+}
+
+# Upstream v0.3 rejects the v0.2 schema outright ("missing [miner].public_host"),
+# and a v0.2 config that somehow parses still leaves REST off because
+# rest_host/rest_port are ignored now. Detect both and rewrite in place.
+migrate_config_v03() {
+  local config_file="$REPO_DIR/data/config.toml"
+  local public_host dashboard_listen has_backend
+
+  [[ -f "$config_file" ]] || return 0
+
+  public_host="$(config_read miner public_host 2>/dev/null || true)"
+  dashboard_listen="$(config_read dashboard listen 2>/dev/null || true)"
+  has_backend="no"
+  grep -Eq '^[[:space:]]*\[(cpu|cuda(\.[0-9]+)?|metal|dwave|qpu)\]' "$config_file" && has_backend="yes"
+
+  if [[ -n "$public_host" && -n "$dashboard_listen" && "$has_backend" == "yes" ]]; then
+    return 0
+  fi
+
+  warn "data/config.toml написан по схеме v0.2 — v0.3 coordinator её не принимает. Мигрирую."
+  rewrite_config_file "$(current_config_validators)" "$(current_faucet_mode)" || return 1
+  ok "config.toml переписан под v0.3 (public_host/public_port + [dashboard] + backend section)."
+}
+
+# A `QUIP_*_TAG=` pin in .env overrides the compose default. The installer used
+# to write `QUIP_MINER_TAG=v0.2`, which after upstream's move to the
+# quip-miner/v0.3/quip-miner path resolves to a tag that was never published
+# there — `docker compose pull` then dies with "not found" and takes the whole
+# stack's pull down with it. Comment the pins out so :latest applies again.
+# The override still carried QUIP_VALIDATORS / QUIP_FAUCET_URL, which no image
+# has read since v0.2.1-rc. Left in place they read as live configuration and
+# quietly contradict data/config.toml, so rewrite the file once.
+migrate_override_file() {
+  local override_file="$REPO_DIR/docker-compose.override.yml"
+
+  [[ -f "$override_file" ]] || return 0
+  grep -Eq 'QUIP_VALIDATORS:|QUIP_FAUCET_URL:' "$override_file" || return 0
+
+  say "Backup override: $(backup_override_file)"
+  write_override_file
+  ok "docker-compose.override.yml переписан без мёртвых QUIP_* env."
+}
+
+migrate_env_tags() {
+  local env_file="$REPO_DIR/.env"
+  local backup
+
+  [[ -f "$env_file" ]] || return 0
+  grep -Eq '^[[:space:]]*QUIP_(MINER|DASHBOARD|VALIDATOR|FAUCET)_TAG[[:space:]]*=' "$env_file" || return 0
+
+  backup="$env_file.xnode-backup-$(date -u +%Y%m%d-%H%M%S)"
+  cp "$env_file" "$backup"
+  sed -i -E 's%^([[:space:]]*QUIP_(MINER|DASHBOARD|VALIDATOR|FAUCET)_TAG[[:space:]]*=.*)$%# xnode: пин снят, образы тянутся по :latest -> \1%' "$env_file"
+  warn "Из .env убраны устаревшие пины образов (QUIP_*_TAG). Backup: $backup"
+}
+
+# The miner is config-driven: QUIP_VALIDATORS / QUIP_FAUCET_URL were dropped
+# from the images back in the v0.2.1-rc line and the v0.3 coordinator reads
+# neither. Validators and the faucet live in data/config.toml now, so this
+# override carries logging and validator flags only.
 write_override_file() {
-  local faucet_mode="$1"
-  local validators="${2:-$PUBLIC_VALIDATORS}"
   local override_file="$REPO_DIR/docker-compose.override.yml"
 
   cat > "$override_file" <<EOF
@@ -466,15 +672,7 @@ x-xnode-logging: &xnode-logging
 services:
   cpu:
     logging: *xnode-logging
-    environment:
-      QUIP_VALIDATORS: "$validators"
 EOF
-
-  if [[ "$faucet_mode" == "disabled" ]]; then
-    cat >> "$override_file" <<'EOF'
-      QUIP_FAUCET_URL: ""
-EOF
-  fi
 
   cat >> "$override_file" <<'EOF'
   quip-validator:
@@ -510,8 +708,8 @@ EOF
 EOF
 }
 
-disable_faucet_in_override() {
-  write_override_file "disabled" "$ACTIVE_VALIDATORS"
+disable_faucet_in_config() {
+  set_config_faucet "disabled"
 }
 
 backup_override_file() {
@@ -608,27 +806,62 @@ status_json() {
   curl -fsS --max-time 5 http://localhost:20049/api/v1/status
 }
 
+# The v0.2 status payload carried modes.cpu.controller.active_url; the v0.3
+# coordinator dropped it and rotates through [miner].validators internally.
+# Try the old field first (older images, and in case it comes back), then fall
+# back to the configured list — which is the operator-facing truth now.
 active_rpc_url() {
+  local value=""
+
   if command -v jq >/dev/null 2>&1 && status_json >/tmp/xnode-quip-status.json 2>/dev/null; then
-    jq -r '.data.modes.cpu.controller.active_url // empty' /tmp/xnode-quip-status.json
-    return 0
+    value="$(jq -r '.data.modes.cpu.controller.active_url // empty' /tmp/xnode-quip-status.json 2>/dev/null || true)"
   fi
 
-  if command -v jq >/dev/null 2>&1 && [[ -f "$REPO_DIR/data/runtime/telemetry-stats-cpu.json" ]]; then
-    jq -r '.controller.active_url // empty' "$REPO_DIR/data/runtime/telemetry-stats-cpu.json" 2>/dev/null
+  if [[ -z "$value" ]] && command -v jq >/dev/null 2>&1 && [[ -f "$REPO_DIR/data/runtime/telemetry-stats-cpu.json" ]]; then
+    value="$(jq -r '.controller.active_url // empty' "$REPO_DIR/data/runtime/telemetry-stats-cpu.json" 2>/dev/null || true)"
   fi
+
+  if [[ -z "$value" ]]; then
+    value="$(current_config_validators 2>/dev/null | cut -d, -f1)"
+  fi
+
+  echo "$value"
 }
 
-wallet_ss58() {
+# `quip-coordinator keygen` (v0.3) writes a keystore holding master_seed_hex
+# only — the ss58/account_id_hex fields the v0.2 entrypoint recorded are gone,
+# and re-deriving them needs sr25519 + ML-DSA, which the host does not have.
+# So read the keystore first and fall back to the miner's own REST surface.
+wallet_field() {
+  local field="$1"
   local keystore="$REPO_DIR/data/keystore.json"
-  [[ -f "$keystore" ]] || return 0
-  python3 - "$keystore" <<'PY'
+  local value=""
+
+  if [[ -f "$keystore" ]]; then
+    value="$(python3 - "$keystore" "$field" <<'PY'
 import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    data = json.load(f)
-print(data.get("ss58", ""))
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        print(json.load(f).get(sys.argv[2], "") or "")
+except Exception:
+    print("")
 PY
+)"
+  fi
+
+  if [[ -z "$value" ]] && command -v jq >/dev/null 2>&1; then
+    case "$field" in
+      ss58)            value="$(status_json 2>/dev/null | jq -r '.data.ss58_address // empty' 2>/dev/null || true)" ;;
+      account_id_hex)  value="$(status_json 2>/dev/null | jq -r '.data.account_id_hex // empty' 2>/dev/null || true)" ;;
+    esac
+  fi
+
+  echo "$value"
 }
+
+wallet_ss58() { wallet_field ss58; }
+
+wallet_account_hex() { wallet_field account_id_hex; }
 
 miner_logs_tail() {
   local lines="${1:-260}"
@@ -640,7 +873,9 @@ faucet_health_check() {
 }
 
 faucet_blocker_seen() {
-  miner_logs_tail 360 | grep -Eiq 'wallet-faucet-failed|faucet returned 502|transfer failed; see faucet logs|balance is still 0'
+  # The last two patterns are the v0.3 coordinator's wording; it exits rather
+  # than crash-looping when it cannot fund the account.
+  miner_logs_tail 360 | grep -Eiq 'wallet-faucet-failed|faucet returned 502|transfer failed; see faucet logs|balance is still 0|miner account is (not funded|underfunded)|refusing to start'
 }
 
 faucet_retry_seen() {
@@ -648,84 +883,145 @@ faucet_retry_seen() {
 }
 
 topology_blocker_seen() {
-  miner_logs_tail 360 | grep -Eiq 'chain has no registered topology|DefaultTopology'
+  # v0.3 no longer exits on a missing topology — it idles and logs
+  # "feeder: chain has no mining snapshot (no registered/mineable topology)".
+  miner_logs_tail 360 | grep -Eiq 'chain has no registered topology|no registered/mineable topology|no mining snapshot|DefaultTopology'
 }
 
 miner_state() {
   docker_cli inspect --format '{{.State.Status}}' quip-cpu 2>/dev/null || echo "missing"
 }
 
-chain_state_query() {
-  local validator="${1:-wss://bootnode-2.testnet.quip.network:20049/rpc}"
-  local ss58
-  ss58="$(wallet_ss58 2>/dev/null || true)"
-
-  if [[ -z "$ss58" ]]; then
-    warn "Wallet SS58 не найден, пропускаю account/miner query."
-  fi
-
-  (cd "$REPO_DIR" && docker_cli compose --profile cpu run --rm --no-deps --pull never --entrypoint python3 cpu -c '
-import asyncio
-import sys
-
-from substrate.client import SubstrateClient
-
-validator = sys.argv[1]
-ss58 = sys.argv[2] if len(sys.argv) > 2 else ""
-
-async def main():
-    client = SubstrateClient(url=validator)
-    await client.connect()
-    iface = client._iface
-
-    async def safe_query(module, storage, params=None):
-        try:
-            if params is None:
-                return await client._run(lambda: iface.query(module, storage))
-            return await client._run(lambda: iface.query(module, storage, params))
-        except Exception as exc:
-            print(f"{module}.{storage}: unavailable ({type(exc).__name__}: {exc})")
-            return None
-
-    default_topology = await safe_query("QuantumPow", "DefaultTopology")
-    difficulty = await safe_query("QuantumPow", "Difficulty")
-
-    print(f"validator: {validator}")
-    print("DefaultTopology:", None if default_topology is None else default_topology.value)
-    print("Difficulty:", None if difficulty is None else difficulty.value)
-
-    if ss58:
-        account = await safe_query("System", "Account", [ss58])
-        miner = await safe_query("QuantumPow", "Miners", [ss58])
-        print("Account:", None if account is None else account.value)
-        print("Miner:", None if miner is None else miner.value)
-
-asyncio.run(main())
-' "$validator" "$ss58")
+# The v0.2 chain queries ran `python3 -c` inside the miner image against its
+# bundled `substrate.client`. The v0.3 image dropped those Python modules, so
+# the queries now go straight at a validator's JSON-RPC over HTTP with
+# precomputed storage keys — no image, no dependencies beyond curl + python3.
+rpc_endpoint_http() {
+  local url="${1:-$PUBLIC_RPC}"
+  case "$url" in
+    # ws://quip-validator:9944 is a compose-network address the host cannot
+    # dial; Caddy fronts the same RPC on the published dashboard port.
+    ws://quip-validator:*|ws://127.0.0.1:*|ws://localhost:*) echo "$LOCAL_RPC_HTTP" ;;
+    wss://*) echo "https://${url#wss://}" ;;
+    ws://*)  echo "http://${url#ws://}" ;;
+    *)       echo "$url" ;;
+  esac
 }
 
-chain_default_topology_present() {
-  local validator="${1:-wss://bootnode-2.testnet.quip.network:20049/rpc}"
-  local out
-  out="$(
-    cd "$REPO_DIR" && docker_cli compose --profile cpu run --rm --no-deps --pull never --entrypoint python3 cpu -c '
-import asyncio
+# rpc_state_get_storage <validator-url> <hex-key>
+# Prints the SCALE-encoded value, or nothing when the key is unset. Returns
+# non-zero only when the endpoint itself could not be reached.
+rpc_state_get_storage() {
+  local endpoint key body
+  endpoint="$(rpc_endpoint_http "${1:-$PUBLIC_RPC}")"
+  key="$2"
+  body="$(curl -fsS --max-time "${XNODE_RPC_TIMEOUT:-12}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"state_getStorage\",\"params\":[\"$key\"]}" \
+    "$endpoint" 2>/dev/null)" || return 1
+  [[ -n "$body" ]] || return 1
+  printf '%s' "$body" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("result") or "")
+except Exception:
+    sys.exit(1)'
+}
+
+# Substrate map key: twox128(pallet) ++ twox128(item) ++ blake2_128(account) ++ account
+account_storage_key() {
+  local prefix="$1" account_hex="$2"
+  python3 - "$prefix" "$account_hex" <<'PY'
+import hashlib, sys
+prefix = bytes.fromhex(sys.argv[1])
+account = bytes.fromhex(sys.argv[2].removeprefix("0x"))
+print("0x" + (prefix + hashlib.blake2b(account, digest_size=16).digest() + account).hex())
+PY
+}
+
+# Number of entries under a storage-map prefix, capped — enough to tell an
+# empty registry from a populated one without pulling 50k keys.
+rpc_state_get_keys_count() {
+  local endpoint prefix body
+  endpoint="$(rpc_endpoint_http "${1:-$PUBLIC_RPC}")"
+  prefix="$2"
+  body="$(curl -fsS --max-time "${XNODE_RPC_TIMEOUT:-12}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"state_getKeysPaged\",\"params\":[\"$prefix\",100,\"$prefix\"]}" \
+    "$endpoint" 2>/dev/null)" || return 1
+  [[ -n "$body" ]] || return 1
+  printf '%s' "$body" | python3 -c 'import json, sys
+try:
+    keys = json.load(sys.stdin).get("result") or []
+except Exception:
+    sys.exit(1)
+print(f"{len(keys)}+" if len(keys) >= 100 else len(keys))'
+}
+
+chain_state_query() {
+  local validator="${1:-$PUBLIC_RPC}"
+  local endpoint account_hex topology registered account miner
+
+  endpoint="$(rpc_endpoint_http "$validator")"
+  account_hex="$(wallet_account_hex 2>/dev/null || true)"
+
+  echo "validator: $validator"
+  echo "endpoint:  $endpoint"
+
+  topology="$(rpc_state_get_storage "$validator" "$SK_DEFAULT_TOPOLOGY")" || {
+    warn "RPC $endpoint не ответил."
+    return 1
+  }
+  registered="$(rpc_state_get_keys_count "$validator" "$SK_REGISTERED_TOPOLOGIES" || true)"
+
+  if [[ -n "$topology" ]]; then
+    echo "DefaultTopology: set ($topology)"
+  else
+    echo "DefaultTopology: None"
+  fi
+  echo "RegisteredTopologies: ${registered:-unknown}"
+
+  if [[ -z "$account_hex" ]]; then
+    echo "Account: wallet unknown (keystore не читается)"
+    return 0
+  fi
+
+  account="$(rpc_state_get_storage "$validator" "$(account_storage_key "$SK_SYSTEM_ACCOUNT_PREFIX" "$account_hex")" || true)"
+  miner="$(rpc_state_get_storage "$validator" "$(account_storage_key "$SK_MINERS_PREFIX" "$account_hex")" || true)"
+
+  if [[ -n "$account" ]]; then
+    # AccountInfo: nonce u32, consumers u32, providers u32, sufficients u32,
+    # then AccountData { free, reserved, frozen, flags } as u128s.
+    python3 - "$account" <<'PY'
 import sys
+raw = bytes.fromhex(sys.argv[1][2:])
+nonce = int.from_bytes(raw[0:4], "little")
+free = int.from_bytes(raw[16:32], "little")
+reserved = int.from_bytes(raw[32:48], "little")
+print(f"Account: nonce={nonce} free={free} ({free / 1e12:.4f} QUIP) reserved={reserved}")
+PY
+  else
+    echo "Account: not found on chain (баланс 0, аккаунт ещё не создан)"
+  fi
 
-from substrate.client import SubstrateClient
+  if [[ -n "$miner" ]]; then
+    echo "Miner: registered"
+  else
+    echo "Miner: not registered"
+  fi
+}
 
-async def main():
-    client = SubstrateClient(url=sys.argv[1])
-    await client.connect()
-    iface = client._iface
-    value = await client._run(lambda: iface.query("QuantumPow", "DefaultTopology"))
-    print("yes" if value is not None and value.value is not None else "no")
-
-asyncio.run(main())
-' "$validator" 2>/dev/null
-  )" || return 2
-
-  [[ "$out" == "yes" ]]
+# Returns 0 when the chain carries a topology, 1 when it does not, and 2 when
+# no validator answered — auto-recover must not stop a miner over an
+# unreachable RPC, so the caller has to tell those apart.
+chain_default_topology_present() {
+  local validator value
+  for validator in "${1:-$PUBLIC_RPC}" "$LOCAL_VALIDATOR"; do
+    if value="$(rpc_state_get_storage "$validator" "$SK_DEFAULT_TOPOLOGY")"; then
+      [[ -n "$value" ]] && return 0
+      return 1
+    fi
+  done
+  return 2
 }
 
 auto_recover_service_name="xnode-quip-auto-recover.service"
@@ -775,7 +1071,10 @@ auto_recover_once() {
     return 0
   fi
 
-  if chain_default_topology_present; then
+  local topology_rc=0
+  chain_default_topology_present || topology_rc=$?
+
+  if (( topology_rc == 0 )); then
     if miner_rest_is_mining; then
       ok "Topology есть, miner уже майнит. Ничего не трогаю."
       return 0
@@ -783,6 +1082,11 @@ auto_recover_once() {
     say "QuantumPow.DefaultTopology есть, но miner не выглядит здоровым. Обновляю/поднимаю stack..."
     compose pull
     compose up -d
+    return 0
+  fi
+
+  if (( topology_rc == 2 )); then
+    warn "Ни один RPC не ответил, состояние topology неизвестно. Miner не трогаю."
     return 0
   fi
 
@@ -925,8 +1229,9 @@ explain_faucet_blocker() {
 explain_topology_blocker() {
   echo
   warn "Кошелёк funded/registered, но chain сейчас без QuantumPow.DefaultTopology."
-  echo "  Miner не может начать PoW без топологии задач и выходит с ошибкой:"
-  echo "  chain has no registered topology; run quip-miner bootstrap --seed-chain first"
+  echo "  Miner не может начать PoW без топологии задач; v0.3 coordinator не падает,"
+  echo "  а простаивает и пишет: feeder: chain has no mining snapshot (no registered/mineable topology)"
+  echo "  Засев делается со стороны Quip: quip-coordinator seed-chain --validator <ws> --sudo-key <sudo>"
   echo
   echo "Что это значит:"
   echo "  - это уже не проблема faucet и не проблема Docker;"
@@ -981,7 +1286,7 @@ show_chain_state() {
   kv "Wallet" "$(wallet_ss58 2>/dev/null || echo unknown)"
   echo
   say "Public bootnode RPC"
-  chain_state_query "wss://bootnode-2.testnet.quip.network:20049/rpc" || warn "Public RPC query failed."
+  chain_state_query "$PUBLIC_RPC" || warn "Public RPC query failed."
   echo
   say "Local validator RPC"
   chain_state_query "ws://quip-validator:9944" || warn "Local RPC query failed."
@@ -999,7 +1304,7 @@ print_chain_state_for_diagnostics() {
   echo "  wallet: $(wallet_ss58 2>/dev/null || echo unknown)"
   echo
   echo "  Public bootnode RPC:"
-  chain_state_query "wss://bootnode-2.testnet.quip.network:20049/rpc" 2>/dev/null | sed 's/^/    /' || echo "    query failed"
+  chain_state_query "$PUBLIC_RPC" 2>/dev/null | sed 's/^/    /' || echo "    query failed"
   echo
   echo "  Local validator RPC:"
   chain_state_query "ws://quip-validator:9944" 2>/dev/null | sed 's/^/    /' || echo "    query failed"
@@ -1030,13 +1335,16 @@ short_status() {
       ok "Miner REST отвечает. Для красивого статуса установи jq или запусти установку."
       return
     fi
+    # Every field is coalesced: one missing key used to make jq fail and print
+    # nothing at all, which is how a schema change silently blanks the status.
     jq -r '
-      "  \u001b[1mwallet\u001b[0m                 " + .data.ss58_address,
+      "  \u001b[1mwallet\u001b[0m                 " + (.data.ss58_address // "unknown"),
       "  \u001b[1mis_mining\u001b[0m              " + (.data.is_mining|tostring),
       "  \u001b[1mregistered\u001b[0m             " + (.data.miner_registered|tostring),
-      "  \u001b[1mhead\u001b[0m                   " + (.data.chain.head_number|tostring),
-      "  \u001b[1mrpc\u001b[0m                    " + .data.modes.cpu.controller.active_url
+      "  \u001b[1mhead\u001b[0m                   " + ((.data.chain.head_number // "unknown")|tostring),
+      "  \u001b[1mproofs\u001b[0m                 " + ((.data.miner_info.proofs_submitted // 0)|tostring) + " submitted, " + ((.data.miner_info.proofs_won // 0)|tostring) + " won"
     ' /tmp/xnode-quip-status.json 2>/dev/null || true
+    kv "rpc" "$(active_rpc_url 2>/dev/null || echo unknown)"
   else
     warn "Miner REST пока не отвечает."
     if topology_blocker_seen; then
@@ -1103,14 +1411,20 @@ wait_for_miner() {
 
     if (cd "$REPO_DIR" && docker_cli compose logs --tail=120 cpu 2>/dev/null | grep -q 'destination already funded'); then
       warn "Поймал баг faucet: destination already funded. Отключаю faucet и пересоздаю miner."
-      disable_faucet_in_override
+      disable_faucet_in_config
       restart_cpu_only
     fi
 
-    if topology_blocker_seen && ! chain_default_topology_present; then
-      explain_topology_blocker
-      stop_cpu_only
-      return 1
+    if topology_blocker_seen; then
+      local topology_rc=0
+      chain_default_topology_present || topology_rc=$?
+      # rc 2 means the RPC was unreachable; only a confirmed absence (rc 1) is
+      # worth stopping the miner over.
+      if (( topology_rc == 1 )); then
+        explain_topology_blocker
+        stop_cpu_only
+        return 1
+      fi
     fi
 
     if (( i % 6 == 0 )); then
@@ -1153,7 +1467,7 @@ wait_for_rpc_url() {
 }
 
 recent_miner_errors() {
-  (cd "$REPO_DIR" && docker_cli compose logs --since=3m cpu 2>/dev/null | grep -Ei 'fatal|traceback|exception|wallet-underfunded|underfunded|destination already funded|connection refused|failed to connect|panic' || true)
+  (cd "$REPO_DIR" && docker_cli compose logs --since=3m cpu 2>/dev/null | grep -Ei 'fatal|traceback|exception|wallet-underfunded|underfunded|destination already funded|connection refused|failed to connect|panic|invalid config|refusing to start' || true)
 }
 
 switch_miner_rpc() {
@@ -1200,7 +1514,7 @@ switch_miner_rpc() {
   say "Backup config: $config_backup_file"
 
   ACTIVE_VALIDATORS="$validators"
-  write_override_file "disabled" "$validators"
+  write_override_file
   set_config_validators "$validators"
   say "Override обновлён. Пересоздаю miner..."
 
@@ -1246,7 +1560,8 @@ switch_miner_rpc() {
   fi
 
   say "Переключение успешно."
-  status_json 2>/dev/null | jq '{is_mining: .data.is_mining, active_url: .data.modes.cpu.controller.active_url, registered: .data.miner_registered}' 2>/dev/null || true
+  status_json 2>/dev/null | jq '{is_mining: .data.is_mining, registered: .data.miner_registered, proofs_submitted: (.data.miner_info.proofs_submitted // 0)}' 2>/dev/null || true
+  kv "rpc" "$(active_rpc_url 2>/dev/null || echo unknown)"
   pause
 }
 
@@ -1306,14 +1621,14 @@ install_node() {
   ACTIVE_VALIDATORS="$validators"
 
   section "Шаг 6/8: Конфигурация"
-  write_env_file "$node_name" "$cpuset"
-  write_config_file "$node_name" "$cpu_count" "$validators"
-
   faucet_mode="enabled"
   if [[ "$has_keystore" == "yes" ]]; then
     faucet_mode="disabled"
   fi
-  write_override_file "$faucet_mode" "$validators"
+
+  write_env_file "$node_name" "$cpuset"
+  write_config_file "$node_name" "$cpu_count" "$validators" "$faucet_mode"
+  write_override_file
   ok ".env, config.toml и docker-compose.override.yml записаны"
 
   section "Шаг 7/8: Настройка хоста"
@@ -1323,7 +1638,7 @@ install_node() {
   start_stack
 
   if wait_for_miner 72; then
-    disable_faucet_in_override
+    disable_faucet_in_config
     say "Faucet отключён в override для будущих restart/update."
     write_summary
     section "Установка завершена"
@@ -1438,6 +1753,15 @@ for k in ("version", "scheme", "encrypted", "ss58", "account_id_hex", "sr25519_p
         print(f"{k}: {v}")
 PY
 
+  # A keystore written by `quip-coordinator keygen` (v0.3) carries the seed and
+  # nothing else, so pull the address off the miner's REST surface instead.
+  if ! grep -q '"ss58"' "$keystore" 2>/dev/null; then
+    echo
+    soft "Keystore v0.3 хранит только master_seed_hex; адрес беру из miner REST."
+    echo "  ss58: $(wallet_ss58 2>/dev/null || echo unknown)"
+    echo "  account_id_hex: $(wallet_account_hex 2>/dev/null || echo unknown)"
+  fi
+
   if [[ "$mode" == "ask-secret" ]]; then
     echo
     warn "Показывать master_seed_hex на экране опасно."
@@ -1461,20 +1785,8 @@ write_summary() {
   account=""
 
   if [[ -f "$keystore" ]]; then
-    ss58="$(python3 - "$keystore" <<'PY'
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    data = json.load(f)
-print(data.get("ss58", ""))
-PY
-)"
-    account="$(python3 - "$keystore" <<'PY'
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    data = json.load(f)
-print(data.get("account_id_hex", ""))
-PY
-)"
+    ss58="$(wallet_ss58 2>/dev/null || true)"
+    account="$(wallet_account_hex 2>/dev/null || true)"
   fi
 
   mkdir -p "$(dirname "$SUMMARY_FILE")"
@@ -1609,21 +1921,32 @@ validator_db_gb() {
   path_size_gb "$REPO_DIR/data/validator-data"
 }
 
-current_override_validators() {
-  local override_file="$REPO_DIR/docker-compose.override.yml"
+current_config_validators() {
   local value
-  if [[ -f "$override_file" ]]; then
-    value="$(awk -F'"' '/QUIP_VALIDATORS:/ {print $2; exit}' "$override_file" 2>/dev/null || true)"
-    if [[ -z "$value" ]]; then
-      value="$(sed -n 's/^[[:space:]]*QUIP_VALIDATORS:[[:space:]]*//p' "$override_file" 2>/dev/null | head -n1 | sed 's/^["'\'']//; s/["'\'']$//')"
-    fi
-  fi
+  value="$(config_read miner validators 2>/dev/null || true)"
   echo "${value:-$PUBLIC_VALIDATORS}"
 }
 
+# faucet_url = "" is how the v0.3 coordinator is told not to auto-fund. An
+# absent key means the image default (the public testnet faucet) applies.
 current_faucet_mode() {
+  local config_file="$REPO_DIR/data/config.toml"
   local override_file="$REPO_DIR/docker-compose.override.yml"
-  if [[ -f "$override_file" ]] && grep -Eq 'QUIP_FAUCET_URL:[[:space:]]*""' "$override_file"; then
+  local value
+  [[ -f "$config_file" ]] || { echo "enabled"; return; }
+  if ! grep -Eq '^[[:space:]]*faucet_url[[:space:]]*=' "$config_file"; then
+    # Pre-v0.3 installs expressed "faucet off" as QUIP_FAUCET_URL: "" in the
+    # override. That env var is inert now, but it still records the operator's
+    # intent, so carry it across instead of silently re-enabling funding.
+    if [[ -f "$override_file" ]] && grep -Eq 'QUIP_FAUCET_URL:[[:space:]]*""' "$override_file"; then
+      echo "disabled"
+    else
+      echo "enabled"
+    fi
+    return
+  fi
+  value="$(config_read miner faucet_url 2>/dev/null || true)"
+  if [[ -z "$value" ]]; then
     echo "disabled"
   else
     echo "enabled"
@@ -1632,12 +1955,10 @@ current_faucet_mode() {
 
 apply_log_limits_to_override() {
   need_repo || return
-  local validators faucet_mode recreate="${1:-ask}"
-  validators="$(current_override_validators)"
-  faucet_mode="$(current_faucet_mode)"
+  local recreate="${1:-ask}"
 
   backup_override_file >/dev/null || true
-  write_override_file "$faucet_mode" "$validators"
+  write_override_file
   ok "Лимит Docker logs записан в docker-compose.override.yml: max-size=$LOG_MAX_SIZE, max-file=$LOG_MAX_FILE"
 
   if [[ "$recreate" == "ask" ]]; then
@@ -1653,12 +1974,10 @@ apply_log_limits_to_override() {
 
 apply_pruned_validator_override() {
   need_repo || return
-  local validators faucet_mode recreate="${1:-ask}"
-  validators="$(current_override_validators)"
-  faucet_mode="$(current_faucet_mode)"
+  local recreate="${1:-ask}"
 
   backup_override_file >/dev/null || true
-  write_override_file "$faucet_mode" "$validators"
+  write_override_file
   ok "Override записан: validator pruning state=$VALIDATOR_STATE_PRUNING blocks=$VALIDATOR_BLOCKS_PRUNING db-cache=${VALIDATOR_DB_CACHE_MB}MB"
 
   warn "Если текущая validator DB была создана как archive, один override не поможет: Substrate хранит pruning mode внутри DB."
@@ -1703,7 +2022,7 @@ reset_validator_db_pruned() {
   need_repo || return
   local quiet="${1:-no}"
   local validator_dir="$REPO_DIR/data/validator-data"
-  local before_size validators faucet_mode
+  local before_size
 
   if [[ "$validator_dir" != "$REPO_DIR"/data/validator-data ]]; then
     fail "Safety check failed for validator dir: $validator_dir"
@@ -1727,10 +2046,8 @@ reset_validator_db_pruned() {
     fi
   fi
 
-  validators="$(current_override_validators)"
-  faucet_mode="$(current_faucet_mode)"
   backup_override_file >/dev/null || true
-  write_override_file "$faucet_mode" "$validators"
+  write_override_file
 
   say "Останавливаю validator/dashboard/caddy..."
   compose stop quip-validator dashboard caddy >/dev/null 2>&1 || true
@@ -2004,9 +2321,12 @@ diagnostics() {
 
 restart_node() {
   need_repo || return
+  local topology_rc
   if topology_blocker_seen; then
     say "Проверяю, появилась ли QuantumPow.DefaultTopology перед запуском miner..."
-    if ! chain_default_topology_present; then
+    topology_rc=0
+    chain_default_topology_present || topology_rc=$?
+    if (( topology_rc == 1 )); then
       explain_topology_blocker
       warn "Miner сейчас не запускаю автоматически, чтобы не тратить баланс на crash-loop."
       read -r -p "Всё равно принудительно перезапустить stack? [y/N]: " force_restart || true
@@ -2016,6 +2336,10 @@ restart_node() {
       fi
     fi
   fi
+  migrate_env_tags
+  migrate_config_v03 || warn "Миграция config.toml не удалась, проверь data/config.toml вручную."
+  migrate_override_file
+
   say "Перезапускаю stack..."
   compose up -d --force-recreate
   wait_for_miner 36 || true
@@ -2061,6 +2385,16 @@ update_node() {
   section "Git repos"
   git_repo_pull_ff "$REPO_DIR" "nodes.quip.network"
   git_repo_pull_ff "$FAUCET_DIR" "faucet" || true
+
+  # Order matters: the freshly pulled compose file points the miner at the v0.3
+  # image path, so the stale .env pin has to go before `compose pull` and the
+  # config has to be on the v0.3 schema before `compose up`.
+  section "Миграция конфигурации"
+  migrate_env_tags
+  # Order matters here too: migrate_config_v03 reads the override's legacy
+  # faucet marker, so the override is rewritten only afterwards.
+  migrate_config_v03 || warn "Миграция config.toml не удалась, проверь data/config.toml вручную."
+  migrate_override_file
 
   section "Docker images"
   compose pull

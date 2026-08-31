@@ -84,6 +84,39 @@ Manage miner auto-recovery:
 ./xnode-quip.sh auto-recover-disable
 ```
 
+## Upgrading an Existing Node to Quip v0.3
+
+Quip moved the miner to a new image repository line
+(`quip-miner/v0.3/quip-miner`) and made `:latest` the default for every quip
+image. A node installed before this change carries a `QUIP_MINER_TAG=v0.2` pin
+in its `.env`, and that tag was never published on the new path, so
+`docker compose pull` fails for the whole stack:
+
+```text
+failed to resolve reference ".../quip-miner/v0.3/quip-miner:v0.2": not found
+```
+
+Run the update and the installer repairs this on its own:
+
+```bash
+./xnode-quip.sh update
+```
+
+It comments the stale image pins out of `.env`, rewrites `data/config.toml` in
+the v0.3 coordinator schema, and drops the environment variables the miner
+images stopped reading. Backups of `.env`, `config.toml`, `keystore.json` and
+`docker-compose.override.yml` are written before anything is changed, and the
+miner wallet is never touched. Re-running `update` afterwards is a no-op.
+
+Two things worth knowing about v0.3:
+
+- `[miner].public_host` and `public_port` are mandatory. The installer fills
+  them with the detected public IP and port `20049`. If the server's public IP
+  changes later, update `public_host` in `data/config.toml` and restart.
+- The faucet is controlled by `[miner].faucet_url` in `data/config.toml`. The
+  old `QUIP_FAUCET_URL` environment variable is ignored by current images. Set
+  `faucet_url = ""` to disable auto-funding.
+
 ## Requirements
 
 Minimum:
