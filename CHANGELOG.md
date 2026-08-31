@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.04
+
+- `./xnode-quip.sh update` exited 1 after a completely successful update. The
+  function ended with `[[ "$confirm" == "ask" ]] && pause`; non-interactively
+  the test is false, the AND list yields 1, and as the last command that became
+  the function's — and the script's — exit status. Any wrapper that checked the
+  exit code saw a failure that had not happened. Found while deploying to a
+  fleet over SSH, where the deploy script aborted on a node that had in fact
+  updated cleanly.
+
 ## 1.03
 
 Extends the watchdog to the colocated validator, and fixes a memory cap that

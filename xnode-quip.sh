@@ -2933,7 +2933,15 @@ update_node() {
   wait_for_miner 36 || true
   write_summary || true
   say "Update завершён. Проверь пункт 6, если хочешь увидеть полную диагностику."
-  [[ "$confirm" == "ask" ]] && pause
+  # Not `[[ ... ]] && pause`: in non-interactive mode the test is false, the
+  # AND list yields 1, and being the last command that becomes the function's
+  # — and the script's — exit status. `./xnode-quip.sh update` then reports
+  # failure after a completely successful update, which breaks every wrapper
+  # that checks the exit code.
+  if [[ "$confirm" == "ask" ]]; then
+    pause
+  fi
+  return 0
 }
 
 update_center() {
