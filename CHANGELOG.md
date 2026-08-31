@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.02
+
+Stall watchdog. The node was observed running for days with a live container,
+`is_mining: true` and 100% CPU while submitting nothing, recovering only on a
+manual restart.
+
+Evidence from this node's own miner logs: the substrate connection degrades and
+the client loops `substrate call cancelled` -> `rebuilding substrate connection`
+forever, roughly 940 of each per day (one per 90-second timeout). Windows with
+zero successful submissions: 24-29 July (6 days), 1-6 August (6 days) and
+15-31 August (17 days). Container state, process liveness and `is_mining` all
+stayed green throughout, which is why the previous auto-recovery — it checked
+only chain topology and `is_mining` — never fired.
+
+- Added a watchdog that judges the miner on forward progress instead of
+  liveness. It samples the miner's chain head, `heads_observed` and
+  `results_received` from the REST API. A healthy node advances about ten
+  chain heads per minute; the watchdog acts only when all three are flat for
+  `XNODE_STALL_SECONDS` (default 900).
+- The watchdog cross-checks the real chain head from the public bootnodes
+  before acting. A halted testnet or a dead uplink freezes the same counters,
+  and restarting the miner for that would only cost rounds.
+- Counter resets are recognised as restarts, not stalls. Every counter is a
+  process-lifetime value that returns to zero when the container restarts, so
+  `uptime_seconds` is sampled alongside them and a drop rebaselines instead of
+  triggering recovery.
+- Recovery escalates: restart the miner container, then recreate it, then
+  recreate the whole stack in case the colocated validator is the wedged
+  party. The cooldown widens with each consecutive attempt (15, 30, 45, 60
+  minutes) so a cause outside the miner cannot turn into a restart loop, and
+  the script says so once five attempts have not helped.
+- The last twenty miner log lines are printed before each recovery, so the
+  reason for a restart survives in the journal.
+- Added `./xnode-quip.sh health`, menu item 4 under auto-recovery, and a
+  watchdog block in the full diagnostics.
+- `auto-recover` no longer runs `docker compose pull` on every five-minute
+  tick. It starts the container when it is down, and otherwise checks progress.
+
 ## 1.01
 
 Compatibility with the Quip v0.3 miner. An existing node fails

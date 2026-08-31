@@ -117,6 +117,51 @@ Two things worth knowing about v0.3:
   old `QUIP_FAUCET_URL` environment variable is ignored by current images. Set
   `faucet_url = ""` to disable auto-funding.
 
+## Stall Watchdog
+
+A Quip node can stop making progress without stopping. The miner container
+stays up, the REST API keeps answering `is_mining: true`, the CPU stays pinned
+at 100%, and nothing is submitted for days. On the node this was developed
+against, that state lasted 6, 6 and 17 days across three separate episodes,
+each ended only by a manual restart.
+
+The watchdog therefore ignores liveness and watches forward progress: the
+miner's view of the chain head, the chain heads it has observed, and the
+results it has taken back from its workers. A healthy node advances roughly ten
+chain heads per minute. When all three counters are flat for 15 minutes *and*
+the public bootnodes show the chain still advancing, the miner is restarted.
+
+Enable it:
+
+```bash
+./xnode-quip.sh auto-recover-install
+```
+
+Inspect it at any time:
+
+```bash
+./xnode-quip.sh health
+```
+
+It runs every five minutes as a systemd timer, and recovery escalates —
+restart the container, recreate it, then recreate the whole stack — with a
+cooldown that widens (15, 30, 45, 60 minutes) so a cause outside the miner
+cannot become a restart loop. Restarts are logged with the twenty miner log
+lines that preceded them:
+
+```bash
+journalctl -u xnode-quip-auto-recover.service --since -7d
+```
+
+Tuning, if the defaults do not suit a host:
+
+| variable | default | meaning |
+|---|---|---|
+| `XNODE_STALL_SECONDS` | `900` | flat counters for this long counts as a stall |
+| `XNODE_STALL_COOLDOWN_SECONDS` | `900` | base gap between recovery attempts |
+
+Turn it off with `./xnode-quip.sh auto-recover-disable`.
+
 ## Requirements
 
 Minimum:

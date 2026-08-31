@@ -36,6 +36,14 @@ PUBLIC_IP_URL="https://api.ipify.org"
 CHECK_PORT_URL="https://check.quip.network/checkport?port="
 SUMMARY_FILE="${XNODE_SUMMARY_FILE:-$BASE_DIR/xnode-quip-summary.txt}"
 BACKUP_DIR="${XNODE_BACKUP_DIR:-$BASE_DIR/backups}"
+HEALTH_STATE_FILE="${XNODE_HEALTH_STATE_FILE:-$BASE_DIR/health-state.json}"
+# How long the miner may show zero forward progress, while the chain keeps
+# advancing, before the watchdog restarts it. A healthy node advances ~10
+# chain heads per minute, so 15 minutes of a flat counter is unambiguous
+# rather than a blip.
+STALL_SECONDS="${XNODE_STALL_SECONDS:-900}"
+# Minimum gap between recovery attempts, widened on repeats (see below).
+STALL_COOLDOWN_SECONDS="${XNODE_STALL_COOLDOWN_SECONDS:-900}"
 LOG_MAX_SIZE="${XNODE_LOG_MAX_SIZE:-50m}"
 LOG_MAX_FILE="${XNODE_LOG_MAX_FILE:-3}"
 VALIDATOR_STATE_PRUNING="${XNODE_VALIDATOR_STATE_PRUNING:-1024}"
@@ -79,7 +87,7 @@ logo() {
   /$$/\  $$| $$ \  $$|  $$$$$$/|  $$$$$$$|  $$$$$$$
  |__/  \__/|__/  \__/ \______/  \_______/ \_______/
 -----------------------
-version 1.00
+version 1.02
 -----------------------
 
         XNODE :: QUIP NODE MANAGER
@@ -1024,6 +1032,325 @@ chain_default_topology_present() {
   return 2
 }
 
+# --- Stall watchdog ---------------------------------------------------------
+#
+# The failure this catches, from two months of this node's own miner logs: the
+# substrate connection degrades, the client loops "call cancelled" ->
+# "rebuilding connection" forever (~940 of each per day, one per 90s timeout),
+# and the miner never submits again. It does NOT crash, the container stays
+# "running", CPU stays pinned at 100% computing attempts nobody will receive,
+# and the REST surface keeps answering is_mining=true. Observed windows with
+# zero successful submissions: Jul 24-29 (6 days), Aug 1-6 (6 days), and
+# Aug 15-31 (17 days), each ended only by a manual restart.
+#
+# So process liveness, container state and is_mining are all useless as health
+# signals — every one of them stayed green through a 17-day stall. What does
+# move is forward progress: the miner's view of the chain head, the heads it
+# has observed, and the results it has taken back from its workers. The
+# watchdog samples those, and only acts when none of them advanced while the
+# real chain did.
+
+# Number of the current best block, in decimal. Empty when the endpoint is
+# unreachable.
+chain_head_number() {
+  local endpoint body
+  endpoint="$(rpc_endpoint_http "${1:-$PUBLIC_RPC}")"
+  body="$(curl -fsS --max-time "${XNODE_RPC_TIMEOUT:-12}" \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"chain_getHeader","params":[]}' \
+    "$endpoint" 2>/dev/null)" || return 1
+  [[ -n "$body" ]] || return 1
+  printf '%s' "$body" | python3 -c 'import json, sys
+try:
+    print(int(json.load(sys.stdin)["result"]["number"], 16))
+except Exception:
+    sys.exit(1)'
+}
+
+# Reference head for the "is the chain itself alive?" guard. Public bootnodes
+# first; the colocated validator is the fallback, and it is only a fallback
+# because a resyncing validator reports its own catch-up height, not the tip.
+reference_head_number() {
+  local value
+  value="$(chain_head_number "$PUBLIC_RPC" 2>/dev/null || true)"
+  if [[ -z "$value" ]]; then
+    value="$(chain_head_number "$LOCAL_VALIDATOR" 2>/dev/null || true)"
+  fi
+  echo "$value"
+}
+
+# "<head> <heads_observed> <results_received> <uptime>" from the miner REST, or
+# empty when it does not answer. uptime is carried because every other number
+# here is a process-lifetime counter that resets to zero on restart, which
+# without this would read exactly like a frozen counter.
+miner_progress_sample() {
+  local body
+  body="$(status_json 2>/dev/null)" || return 1
+  [[ -n "$body" ]] || return 1
+  printf '%s' "$body" | python3 -c 'import json, sys
+try:
+    d = json.load(sys.stdin)["data"]
+    c = d.get("modes", {}).get("cpu", {}).get("controller", {})
+    print(d.get("chain", {}).get("head_number", 0),
+          c.get("heads_observed", 0),
+          c.get("results_received", 0),
+          d.get("uptime_seconds", 0))
+except Exception:
+    sys.exit(1)'
+}
+
+health_state_get() {
+  local key="$1"
+  [[ -f "$HEALTH_STATE_FILE" ]] || { echo ""; return 0; }
+  python3 - "$HEALTH_STATE_FILE" "$key" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        print(json.load(fh).get(sys.argv[2], "") or "")
+except Exception:
+    print("")
+PY
+}
+
+# health_state_put key=value ...
+health_state_put() {
+  mkdir -p "$(dirname "$HEALTH_STATE_FILE")"
+  python3 - "$HEALTH_STATE_FILE" "$@" <<'PY'
+import json, os, sys, tempfile
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        state = json.load(fh)
+    if not isinstance(state, dict):
+        state = {}
+except Exception:
+    state = {}
+
+for pair in sys.argv[2:]:
+    key, _, value = pair.partition("=")
+    try:
+        state[key] = int(value)
+    except ValueError:
+        state[key] = value
+
+# Write through a temp file so a crash mid-write cannot leave the watchdog
+# with a truncated state file it would then treat as a first run.
+directory = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(state, fh, indent=2, sort_keys=True)
+os.replace(tmp, path)
+PY
+}
+
+# Escalating recovery. A plain restart fixes a wedged connection; recreate
+# clears in-container state a restart preserves; the full stack pass covers the
+# case where the colocated validator is the wedged party, not the miner.
+recover_miner_escalate() {
+  local level="$1"
+
+  case "$level" in
+    1)
+      say "Уровень 1: перезапускаю miner контейнер."
+      compose restart cpu
+      ;;
+    2)
+      say "Уровень 2: пересоздаю miner контейнер."
+      compose up -d --force-recreate --no-deps cpu
+      ;;
+    *)
+      say "Уровень 3: пересоздаю весь stack."
+      compose up -d --force-recreate
+      ;;
+  esac
+}
+
+# Returns 0 healthy, 1 stalled (action taken), 2 undetermined.
+# Pass "report" to inspect without touching anything.
+miner_stall_check() {
+  local mode="${1:-act}"
+  local now sample head heads results uptime reference
+  local prev_head prev_heads prev_results prev_uptime prev_reference
+  local last_progress last_action actions stalled_for progressed
+
+  now="$(date -u +%s)"
+  reference="$(reference_head_number)"
+
+  if [[ -z "$reference" ]]; then
+    warn "Ни один RPC не ответил — состояние сети неизвестно, watchdog ничего не делает."
+    return 2
+  fi
+
+  sample="$(miner_progress_sample 2>/dev/null || true)"
+  if [[ -n "$sample" ]]; then
+    read -r head heads results uptime <<< "$sample"
+  else
+    # REST silent is itself a stall symptom, but it is also what a container
+    # that is merely starting looks like, so it counts as "no progress"
+    # rather than as an immediate trigger.
+    head=""; heads=""; results=""; uptime=""
+  fi
+
+  prev_head="$(health_state_get head_number)"
+  prev_heads="$(health_state_get heads_observed)"
+  prev_results="$(health_state_get results_received)"
+  prev_uptime="$(health_state_get uptime_seconds)"
+  prev_reference="$(health_state_get reference_head)"
+  last_progress="$(health_state_get last_progress_at)"
+  last_action="$(health_state_get last_action_at)"
+  actions="$(health_state_get stall_actions)"
+  [[ "$last_progress" =~ ^[0-9]+$ ]] || last_progress=0
+  [[ "$last_action" =~ ^[0-9]+$ ]] || last_action=0
+  [[ "$actions" =~ ^[0-9]+$ ]] || actions=0
+
+  # First run, or a state file from before this feature existed: record and go.
+  if (( last_progress == 0 )); then
+    if [[ "$mode" == "report" ]]; then
+      soft "Watchdog: базовой точки ещё нет, оценка появится после первой проверки таймером."
+      return 0
+    fi
+    health_state_put "head_number=${head:-0}" "heads_observed=${heads:-0}" \
+      "results_received=${results:-0}" "uptime_seconds=${uptime:-0}" \
+      "reference_head=$reference" \
+      "last_progress_at=$now" "last_action_at=0" "stall_actions=0"
+    say "Watchdog: базовая точка записана, оценка со следующей проверки."
+    return 0
+  fi
+
+  # A restart — ours, docker's restart policy, or a host reboot — zeroes every
+  # counter below. Rebaseline on it, because "counter is lower than last time"
+  # is the opposite of a stall and must never be read as one.
+  if [[ -n "$uptime" ]] && [[ "$prev_uptime" =~ ^[0-9]+$ ]] && (( uptime < prev_uptime )); then
+    if [[ "$mode" != "report" ]]; then
+      health_state_put "head_number=$head" "heads_observed=$heads" \
+        "results_received=$results" "uptime_seconds=$uptime" \
+        "reference_head=$reference" "last_progress_at=$now"
+    fi
+    say "Watchdog: miner перезапускался (uptime $uptime с), базовая точка обновлена."
+    return 0
+  fi
+
+  progressed="no"
+  if [[ -n "$head" ]]; then
+    (( head > ${prev_head:-0} )) && progressed="yes"
+    (( heads > ${prev_heads:-0} )) && progressed="yes"
+    (( results > ${prev_results:-0} )) && progressed="yes"
+  fi
+
+  if [[ "$progressed" == "yes" ]]; then
+    if [[ "$mode" == "report" ]]; then
+      ok "Watchdog: miner двигается (head=$head heads=$heads results=$results)."
+    else
+      health_state_put "head_number=$head" "heads_observed=$heads" \
+        "results_received=$results" "uptime_seconds=$uptime" \
+        "reference_head=$reference" \
+        "last_progress_at=$now" "stall_actions=0"
+    fi
+    return 0
+  fi
+
+  # No local progress. Before blaming the miner, confirm the chain moved — a
+  # halted testnet or a dead uplink must not trigger a restart loop.
+  if [[ "$prev_reference" =~ ^[0-9]+$ ]] && (( reference <= prev_reference )); then
+    [[ "$mode" == "report" ]] || health_state_put "reference_head=$reference"
+    warn "Watchdog: chain head не растёт ($reference) — проблема на стороне сети, miner не трогаю."
+    return 2
+  fi
+
+  [[ "$mode" == "report" ]] || health_state_put "reference_head=$reference"
+  stalled_for=$(( now - last_progress ))
+
+  if (( stalled_for < STALL_SECONDS )); then
+    if [[ "$mode" == "report" ]]; then
+      ok "Watchdog: последний прогресс $stalled_for с назад, порог $STALL_SECONDS с — норма."
+    else
+      warn "Watchdog: прогресса нет $stalled_for с (порог $STALL_SECONDS с). Жду ещё."
+    fi
+    return 0
+  fi
+
+  if [[ "$mode" == "report" ]]; then
+    bad "Watchdog: miner застоялся $stalled_for с, chain при этом идёт (head=$reference)."
+    return 1
+  fi
+
+  # Widen the cooldown as attempts pile up. If restarting is not fixing it the
+  # cause is elsewhere (network, chain, disk), and hammering the container
+  # every 15 minutes only adds noise and lost rounds.
+  local cooldown=$(( STALL_COOLDOWN_SECONDS * ( actions < 4 ? actions + 1 : 4 ) ))
+  if (( now - last_action < cooldown )); then
+    warn "Watchdog: застой подтверждён, но с прошлого рестарта прошло $(( now - last_action )) с. Жду окончания cooldown ($cooldown с)."
+    return 1
+  fi
+
+  if (( actions >= 5 )); then
+    warn "Watchdog: рестарты не помогают ($actions подряд). Смотри пункт 6 (диагностика) — причина вне miner."
+  fi
+
+  actions=$(( actions + 1 ))
+  bad "Watchdog: застой $stalled_for с при живой chain (head=$reference). Восстановление, попытка $actions."
+  miner_logs_tail 40 | tail -20
+  recover_miner_escalate "$actions"
+
+  # Give the container a moment to come up so the next sample is meaningful
+  # rather than a second "REST silent" reading.
+  sleep 20
+  sample="$(miner_progress_sample 2>/dev/null || true)"
+  if [[ -n "$sample" ]]; then
+    read -r head heads results uptime <<< "$sample"
+    health_state_put "head_number=$head" "heads_observed=$heads" \
+      "results_received=$results" "uptime_seconds=$uptime"
+  fi
+
+  # last_progress is advanced to now so the next window is measured from the
+  # restart, not from the original stall; stall_actions keeps climbing until a
+  # sample actually shows progress, which is what drives the escalation.
+  health_state_put "last_action_at=$now" "last_progress_at=$now" "stall_actions=$actions"
+  return 1
+}
+
+show_health_status() {
+  need_repo || return
+  local sample head heads results uptime reference last_progress actions now stalled_for
+
+  section "Watchdog: живость miner"
+  now="$(date -u +%s)"
+  reference="$(reference_head_number)"
+  sample="$(miner_progress_sample 2>/dev/null || true)"
+  last_progress="$(health_state_get last_progress_at)"
+  actions="$(health_state_get stall_actions)"
+  [[ "$last_progress" =~ ^[0-9]+$ ]] || last_progress=0
+  [[ "$actions" =~ ^[0-9]+$ ]] || actions=0
+
+  kv "Порог застоя" "$STALL_SECONDS с"
+  kv "Cooldown" "$STALL_COOLDOWN_SECONDS с"
+  kv "Chain head (сеть)" "${reference:-нет ответа}"
+
+  if [[ -n "$sample" ]]; then
+    read -r head heads results uptime <<< "$sample"
+    kv "Miner uptime" "$uptime с"
+    kv "Miner head" "$head"
+    kv "Heads observed" "$heads"
+    kv "Results received" "$results"
+    if [[ -n "$reference" ]] && (( reference - head > 50 )); then
+      warn "Miner отстаёт от сети на $(( reference - head )) блоков."
+    fi
+  else
+    bad "Miner REST не отвечает."
+  fi
+
+  if (( last_progress > 0 )); then
+    stalled_for=$(( now - last_progress ))
+    kv "Прогресс был" "$stalled_for с назад"
+  else
+    kv "Прогресс был" "ещё не замерялся"
+  fi
+  kv "Рестартов подряд" "$actions"
+  echo
+  miner_stall_check report || true
+}
+
 auto_recover_service_name="xnode-quip-auto-recover.service"
 auto_recover_timer_name="xnode-quip-auto-recover.timer"
 cleanup_service_name="xnode-quip-cleanup.service"
@@ -1075,13 +1402,19 @@ auto_recover_once() {
   chain_default_topology_present || topology_rc=$?
 
   if (( topology_rc == 0 )); then
-    if miner_rest_is_mining; then
-      ok "Topology есть, miner уже майнит. Ничего не трогаю."
+    # Container down (e.g. stopped earlier because topology was missing, and it
+    # is back now) is the one case that needs a plain start rather than the
+    # progress check, which would just read a silent REST.
+    if [[ "$(miner_state)" != "running" ]]; then
+      say "Topology есть, а miner контейнер не запущен. Поднимаю stack..."
+      compose up -d
       return 0
     fi
-    say "QuantumPow.DefaultTopology есть, но miner не выглядит здоровым. Обновляю/поднимаю stack..."
-    compose pull
-    compose up -d
+
+    # Container is up. That proves nothing — through every historical stall it
+    # stayed up and kept reporting is_mining=true — so judge it on forward
+    # progress instead.
+    miner_stall_check act || true
     return 0
   fi
 
@@ -1113,7 +1446,7 @@ install_auto_recover_timer() {
   say "Устанавливаю systemd timer для авто-восстановления miner..."
   $SUDO tee "$service_file" >/dev/null <<EOF
 [Unit]
-Description=XNODE Quip auto-recover miner when testnet topology is available
+Description=XNODE Quip miner watchdog: restart on stall, resume when topology returns
 After=docker.service network-online.target
 Wants=network-online.target
 
@@ -1125,7 +1458,7 @@ EOF
 
   $SUDO tee "$timer_file" >/dev/null <<EOF
 [Unit]
-Description=Run XNODE Quip auto-recover every 5 minutes
+Description=Run XNODE Quip miner watchdog every 5 minutes
 
 [Timer]
 OnActiveSec=2min
@@ -1142,7 +1475,8 @@ EOF
   $SUDO systemctl enable "$auto_recover_timer_name" >/dev/null
   $SUDO systemctl restart "$auto_recover_timer_name"
   ok "Автовосстановление включено: $auto_recover_timer_name"
-  soft "Проверка будет идти каждые 5 минут. Когда DefaultTopology появится, miner поднимется сам."
+  soft "Проверка каждые 5 минут. Watchdog перезапустит miner, если он перестанет двигаться вперёд"
+  soft "(порог $STALL_SECONDS с без прогресса при живой chain), и поднимет его, когда вернётся DefaultTopology."
   [[ "$quiet" == "yes" ]] || pause
 }
 
@@ -1181,6 +1515,7 @@ ${bold}Автовосстановление miner:${reset}
 1) Включить timer
 2) Выключить timer
 3) Разово проверить сейчас
+4) Показать живость miner (watchdog)
 0) Назад
 EOF
     read -r -p "Выбор: " choice
@@ -1188,6 +1523,7 @@ EOF
       1) install_auto_recover_timer ;;
       2) disable_auto_recover_timer ;;
       3) auto_recover_once; pause ;;
+      4) logo; show_health_status; pause ;;
       0) return ;;
       *) warn "Нет такого пункта."; sleep 1 ;;
     esac
@@ -2302,6 +2638,8 @@ diagnostics() {
   print_auto_recover_hint
   print_chain_state_for_diagnostics
   echo
+  show_health_status || true
+
   say "Dashboard health"
   curl -fsS http://localhost:20049/api/health 2>/dev/null || true
   echo
@@ -2504,6 +2842,7 @@ case "${1:-menu}" in
   backup) backup_keystore ;;
   auto-recover) auto_recover_once ;;
   auto-recover-status) auto_recover_status_cli ;;
+  health) logo; show_health_status ;;
   auto-recover-install) install_auto_recover_timer "yes" ;;
   auto-recover-disable) disable_auto_recover_timer "yes" ;;
   restart) restart_node ;;
@@ -2521,5 +2860,5 @@ case "${1:-menu}" in
   validator-reset) logo; reset_validator_db_pruned ;;
   rpc-local) switch_miner_rpc local ;;
   rpc-public) switch_miner_rpc public ;;
-  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|storage-guard|validator-prune-override|validator-reset|rpc-local|rpc-public]"; exit 1 ;;
+  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|health|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|storage-guard|validator-prune-override|validator-reset|rpc-local|rpc-public]"; exit 1 ;;
 esac
