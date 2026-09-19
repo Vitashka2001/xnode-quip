@@ -84,6 +84,85 @@ Manage miner auto-recovery:
 ./xnode-quip.sh auto-recover-disable
 ```
 
+## Aglais, and Linking a Node to Your Account
+
+### The network changed
+
+Quip replaced its testnet on 2026-09-02. The new one is **Aglais**: fresh
+genesis, runtime spec 117, token `AGLS`. The old chain still runs while
+operators move and is being retired, so a node left on it mines something with
+no future. The two are mutually exclusive — a spec-116 stack cannot join
+Aglais and a spec-117 stack cannot join the old chain.
+
+Check which network a node is on:
+
+```bash
+./xnode-quip.sh network
+```
+
+Migrate it. `update` detects a pre-Aglais layout and does this on its own;
+the explicit command is:
+
+```bash
+./xnode-quip.sh migrate-aglais
+```
+
+The validator resyncs Aglais from genesis, which takes hours rather than days
+— Aglais is young. Nothing from the old chain is deleted: `data/validator-data`
+and the old dashboard volume stay until you remove them yourself.
+
+The miner does not start until the validator has caught up. That is upstream's
+gating, not a fault, and the watchdog knows about it.
+
+### Your wallet goes in the node name
+
+`[miner].node_name` is published on chain inside the node descriptor, and the
+points platform reads it there. **It is the only thing linking a running node
+to an operator account.** A node without a wallet in its name earns for nobody.
+
+The convention is visible in the data. Of 4803 node descriptors indexed from
+the retired chain, 4610 carry an EVM address in `nodeName`, and 4460 use one
+exact form:
+
+```
+Label - 0xYourWalletAddress
+```
+
+The installer asks for the wallet during install. To set or change it later:
+
+```bash
+./xnode-quip.sh set-wallet 0xYourWalletAddress
+```
+
+That rewrites the name, keeps the label, and restarts the miner so the
+descriptor is republished.
+
+Note that the wallet in the node name and the miner's own on-chain account are
+two different things. The miner generates its own keystore at
+`data/keystore.json` and funds and registers that account through the Aglais
+faucet; chain rewards accrue there. The wallet in the name is what the
+off-chain points platform uses for attribution. Also, current miner images
+derive a different on-chain account from the same seed than older ones did, so
+the `ss58` field inside `keystore.json` is stale — read the live account from
+the dashboard, not from the file.
+
+### Release channel
+
+Images follow `CHANNEL`, not per-image tags. The installer writes
+`CHANNEL=beta`, which is upstream's default and the only channel consistent
+with the current compose file: the dashboard's `stable` tag is still the
+Postgres-backed build and exits with `DATABASE_URL is required`. Never set
+these images to `latest` — that tag is pre-Aglais. Override with
+`XNODE_CHANNEL=stable` if you have a reason to.
+
+### Validator disk
+
+The validator runs `--state-pruning=archive --blocks-pruning=archive` and its
+database grows without bound. That is the supported configuration: pruning
+breaks the dashboard's descriptor worker and, per upstream, likely reduces
+point awards. Size the disk for it. The storage guard will warn when free
+space runs low but will never reset the database on its own.
+
 ## Upgrading an Existing Node to Quip v0.3
 
 Quip moved the miner to a new image repository line

@@ -7,11 +7,43 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${XNODE_BASE_DIR:-$SCRIPT_DIR/quip_node}"
 REPO_DIR="${XNODE_QUIP_DIR:-$BASE_DIR/nodes.quip.network}"
 FAUCET_DIR="${XNODE_FAUCET_DIR:-$BASE_DIR/faucet}"
-PUBLIC_VALIDATORS="wss://bootnode-2.testnet.quip.network:20049/rpc,wss://bootnode-3.testnet.quip.network:20049/rpc"
+# Aglais replaced the previous Quip testnet on 2026-09-02 with a fresh genesis.
+# A spec-116 stack cannot join Aglais and a spec-117 stack cannot join the
+# retired chain, so every endpoint below moved together.
+PUBLIC_VALIDATORS="wss://bootnode-1.aglais.quip.network:20049/rpc,wss://bootnode-2.aglais.quip.network:20049/rpc"
 LOCAL_VALIDATOR="ws://quip-validator:9944"
-ACTIVE_VALIDATORS="$PUBLIC_VALIDATORS"
-FAUCET_URL="https://faucet.testnet.quip.network"
-PUBLIC_RPC="wss://bootnode-2.testnet.quip.network:20049/rpc"
+ACTIVE_VALIDATORS="$LOCAL_VALIDATOR"
+FAUCET_URL="https://faucet.aglais.quip.network"
+PUBLIC_RPC="wss://bootnode-1.aglais.quip.network:20049/rpc"
+# Genesis of Aglais. Used to tell a migrated node from one still on the
+# retired chain without trusting a tag or a directory name.
+AGLAIS_GENESIS="0x59e064bddd49a920d1392693c728c3bf9867f2cf3e0f8fea8c2498b389b0c286"
+RETIRED_GENESIS="0xa1394e7a91995ac2f60a886f804817cf7205b03e32d67ce06169f8b17337a9a7"
+# Release channel driving every image tag. Both channels run Aglais (spec 117);
+# `latest` is pre-Aglais and must never be used.
+#
+# beta, not stable, and deliberately: the repo's main branch carries the
+# embedded-dashboard stack, where Caddy, the log collector and the index
+# database all run inside the dashboard image and the `postgres` and `caddy`
+# services are gone. The dashboard's `stable` tag is still the old
+# Postgres-backed build, which exits with "DATABASE_URL is required" against
+# this compose file. Upstream ships beta as the default for the same reason —
+# a fresh clone with no .env runs beta.
+QUIP_CHANNEL="${XNODE_CHANNEL:-beta}"
+# The dashboard image refuses PUID/PGID of 0 and exits, so the old PUID=0
+# default is no longer usable.
+NODE_PUID="${XNODE_PUID:-1000}"
+NODE_PGID="${XNODE_PGID:-1000}"
+# Aglais keeps chain id `quip_testnet`, so its database would land in the same
+# chains/quip_testnet subdirectory the retired chain used and be rejected on a
+# genesis mismatch. Upstream moved the base path; the old tree stays put.
+VALIDATOR_DIR_NAME="aglais-chain-db"
+RETIRED_VALIDATOR_DIR_NAME="validator-data"
+# Wallet the node is attributed to on the points platform. Published on chain
+# inside the node descriptor as part of [miner].node_name — that is the only
+# link between a running node and an operator account.
+NODE_WALLET="${XNODE_NODE_WALLET:-}"
+NODE_LABEL="${XNODE_NODE_LABEL:-}"
 # Caddy publishes the local validator's JSON-RPC on the same host port as the
 # dashboard (see caddy/Caddyfile `handle /rpc`), so the host reaches it without
 # a container exec.
@@ -50,8 +82,12 @@ STALL_COOLDOWN_SECONDS="${XNODE_STALL_COOLDOWN_SECONDS:-900}"
 VALIDATOR_STALL_SECONDS="${XNODE_VALIDATOR_STALL_SECONDS:-1800}"
 LOG_MAX_SIZE="${XNODE_LOG_MAX_SIZE:-50m}"
 LOG_MAX_FILE="${XNODE_LOG_MAX_FILE:-3}"
-VALIDATOR_STATE_PRUNING="${XNODE_VALIDATOR_STATE_PRUNING:-1024}"
-VALIDATOR_BLOCKS_PRUNING="${XNODE_VALIDATOR_BLOCKS_PRUNING:-1024}"
+# The validator runs --state-pruning=archive --blocks-pruning=archive, set in
+# the upstream compose file. That is the supported configuration and the disk
+# has to be sized for it: pruning breaks the dashboard's descriptor worker,
+# which scans from genesis and dies with "State already discarded", and
+# upstream states it likely reduces point awards. XNODE used to force
+# state=1024/blocks=1024 through an override; it no longer does.
 VALIDATOR_DB_CACHE_MB="${XNODE_VALIDATOR_DB_CACHE_MB:-256}"
 VALIDATOR_RESET_THRESHOLD_GB="${XNODE_VALIDATOR_RESET_THRESHOLD_GB:-55}"
 
@@ -91,7 +127,7 @@ logo() {
   /$$/\  $$| $$ \  $$|  $$$$$$/|  $$$$$$$|  $$$$$$$
  |__/  \__/|__/  \__/ \______/  \_______/ \_______/
 -----------------------
-version 1.02
+version 2.00
 -----------------------
 
         XNODE :: QUIP NODE MANAGER
@@ -366,7 +402,7 @@ check_port_conflicts() {
   local occupied="no"
   for port in 20049 30333; do
     if ss -ltn 2>/dev/null | grep -q ":$port "; then
-      if docker_cli ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(quip-caddy|quip-validator)$'; then
+      if docker_cli ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(quip-dashboard|quip-validator)$'; then
         warn "Port $port уже слушает существующий Quip контейнер — repair/restart допустим."
       else
         bad "Port $port уже занят другим процессом. Освободи порт перед установкой."
@@ -434,28 +470,27 @@ write_env_file() {
 
   cat > "$env_file" <<EOF
 # Written by XNODE Quip installer.
+
+# Release channel. Drives every image tag, the validator included. Both
+# channels run Aglais (runtime spec 117); stable is the released line, beta
+# runs ahead of it. Never set these images to :latest — that tag is still the
+# pre-Aglais build and cannot join this chain.
+CHANNEL=$QUIP_CHANNEL
+
+# No QUIP_*_TAG pins. A pin always beats CHANNEL, and a stale one is how a
+# stack ends up on an image that cannot run the current chain. Pin only to
+# freeze a deploy, and delete the line rather than updating it.
+
+# The dashboard image refuses 0 and exits, so these must be positive.
+PUID=$NODE_PUID
+PGID=$NODE_PGID
+
 QUIP_HOSTNAME=:20049
-PUID=0
-PGID=0
-# Image tags are deliberately NOT pinned here. Upstream moved the miner to the
-# v0.3 repository line (quip-miner/v0.3/quip-miner) and made :latest the
-# compose default for every quip image; a leftover QUIP_MINER_TAG=v0.2 pin
-# resolves to a tag that does not exist on that path and fails the pull with
-# "not found". Every service sets pull_policy: always, so an unpinned stack
-# re-resolves :latest on every up. Pin one of these only to freeze a deploy:
-#   QUIP_MINER_TAG=v0.3.1-rc2
-#   QUIP_DASHBOARD_TAG=v0.2.1
-#   QUIP_VALIDATOR_TAG=v0.2.2-rc4
-#   QUIP_FAUCET_TAG=latest
 QUIP_MINER_CPUSET=$cpuset
-# Sized from this host's RAM. The compose default (16g) is above total memory
-# on a smaller box, which turns the cap off exactly where it matters.
+# Sized from this host's RAM. The compose default (16g) sits above total
+# memory on a smaller box, which turns the cap off exactly where it matters.
 QUIP_MINER_MEM_LIMIT=$(default_miner_mem_limit)
 VALIDATOR_NAME=$node_name-validator
-SUBSTRATE_BOOTNODES=
-POSTGRES_DB=quip
-POSTGRES_USER=quip
-POSTGRES_PASSWORD=quip
 EOF
 }
 
@@ -547,10 +582,27 @@ config_public_host() {
   echo "$host"
 }
 
+# Build [miner].node_name. This string is published on chain inside the node
+# descriptor, and the points platform reads it to decide which operator
+# account a node belongs to: 96% of the network (4460 of 4803 descriptors
+# indexed on the retired chain) carry an EVM address here, 4460 of them in the
+# exact form "Label - 0xADDRESS". Nothing else links a node to an account, so
+# a node with no wallet in its name earns for nobody.
+compose_node_name() {
+    local label="$1"
+    local wallet="${2:-$NODE_WALLET}"
+    label="${label:-xnode-quip}"
+    if [[ -n "$wallet" ]]; then
+    echo "$label - $wallet"
+  else
+    echo "$label"
+  fi
+}
+
 write_config_file() {
   local node_name="$1"
   local cpu_count="$2"
-  local validators="${3:-$PUBLIC_VALIDATORS}"
+  local validators="${3:-$LOCAL_VALIDATOR}"
   local faucet_mode="${4:-enabled}"
   local config_file="$REPO_DIR/data/config.toml"
   local backup faucet_url public_host
@@ -561,7 +613,6 @@ write_config_file() {
   public_host="$(config_public_host)"
   if [[ -z "$public_host" ]]; then
     fail "Не удалось определить public_host, а v0.3 coordinator без него не стартует."
-    fail "Задай его вручную в $config_file или экспортируй XNODE_PUBLIC_HOST."
     return 1
   fi
 
@@ -575,10 +626,7 @@ write_config_file() {
   fi
 
   cat > "$config_file" <<EOF
-# quip-coordinator v0.3 CPU configuration, written by XNODE.
-# Schema notes: [miner].public_host/public_port are mandatory, the old
-# rest_host/rest_port pair is gone (the REST surface moved to [dashboard]),
-# and at least one backend section must be present.
+# quip-coordinator configuration for Aglais, written by XNODE.
 
 [miner]
 validators = [
@@ -591,21 +639,20 @@ EOF
   cat >> "$config_file" <<EOF
 ]
 signer_key = "/data/keystore.json"
+# Published on chain in the node descriptor. The wallet in this string is what
+# attributes the node to an operator account on the points platform.
 node_name = "$node_name"
-# Empty disables auto-funding; the coordinator refuses to start on an
-# underfunded account when it has no faucet to ask.
+# Aglais faucet. The miner funds and registers its own account here on first
+# start; empty disables auto-funding.
 faucet_url = "$faucet_url"
-# Address peers use to reach this node. Required, and "" is not a host.
 public_host = "$public_host"
 public_port = $MINER_PUBLIC_PORT
 
 [cpu]
-# Bundled miner binary; quip-cpu-gibbs is the other choice.
 binary = "quip-cpu-sa"
 num_cpus = $cpu_count
 
-# Miner telemetry + /api/v1/* REST. The port must match the
-# reverse_proxy quip-miner:8086 line in caddy/Caddyfile.
+# REST surface Caddy fronts at /api/v1/*. 8086 matches QUIP_MINER_REST_URL.
 [dashboard]
 listen = "0.0.0.0:$MINER_REST_PORT"
 data_dir = "/data/attempts"
@@ -616,13 +663,20 @@ EOF
 # what the caller passes. Both setters below funnel through this.
 rewrite_config_file() {
   local validators="$1" faucet_mode="$2"
-  local node_name cpu_count
+  local node_name cpu_count label wallet
 
   node_name="$(config_read miner node_name 2>/dev/null || true)"
   cpu_count="$(config_read cpu num_cpus 2>/dev/null || true)"
-  node_name="${node_name:-xnode-quip}"
   [[ "$cpu_count" =~ ^[0-9]+$ ]] || cpu_count=1
-  write_config_file "$node_name" "$cpu_count" "$validators" "$faucet_mode"
+
+  # Split the stored name back into label and wallet so a caller that sets
+  # NODE_WALLET can change the attribution without losing the label, and a
+  # caller that does not keeps whatever is already there.
+  label="${node_name%% - 0x*}"
+  label="${label:-xnode-quip}"
+  wallet="${NODE_WALLET:-$(grep -oE '0x[0-9a-fA-F]{40}' <<< "${node_name:-}" | head -n1)}"
+
+  write_config_file "$(compose_node_name "$label" "$wallet")" "$cpu_count" "$validators" "$faucet_mode"
 }
 
 set_config_validators() {
@@ -663,22 +717,6 @@ migrate_config_v03() {
 # quip-miner/v0.3/quip-miner path resolves to a tag that was never published
 # there — `docker compose pull` then dies with "not found" and takes the whole
 # stack's pull down with it. Comment the pins out so :latest applies again.
-# The override still carried QUIP_VALIDATORS / QUIP_FAUCET_URL, which no image
-# has read since v0.2.1-rc. Left in place they read as live configuration and
-# quietly contradict data/config.toml, so rewrite the file once.
-migrate_override_file() {
-  local override_file="$REPO_DIR/docker-compose.override.yml"
-
-  [[ -f "$override_file" ]] || return 0
-  grep -Eq 'QUIP_VALIDATORS:|QUIP_FAUCET_URL:' "$override_file" || return 0
-
-  say "Backup override: $(backup_override_file)"
-  write_override_file
-  ok "docker-compose.override.yml переписан без мёртвых QUIP_* env."
-}
-
-# An .env written before the cap was sized has no QUIP_MINER_MEM_LIMIT at all,
-# so compose falls back to its 16g default.
 migrate_env_mem_limit() {
   local env_file="$REPO_DIR/.env"
   local limit
@@ -704,57 +742,24 @@ migrate_env_tags() {
   warn "Из .env убраны устаревшие пины образов (QUIP_*_TAG). Backup: $backup"
 }
 
-# The miner is config-driven: QUIP_VALIDATORS / QUIP_FAUCET_URL were dropped
-# from the images back in the v0.2.1-rc line and the v0.3 coordinator reads
-# neither. Validators and the faucet live in data/config.toml now, so this
-# override carries logging and validator flags only.
-write_override_file() {
+# XNODE no longer ships a docker-compose.override.yml, and removes any it
+# previously wrote. Everything it used to carry now lives in the base compose
+# file and would be actively harmful to restate:
+#   * logging moved from per-container json-file to a syslog driver pointing
+#     at the collector inside the dashboard image;
+#   * the validator runs --state-pruning=archive --blocks-pruning=archive,
+#     and an override that restates `command:` replaces the whole list,
+#     silently dropping archive mode. Pruning breaks the dashboard indexer
+#     ("State already discarded") and reduces point awards;
+#   * `postgres` and `caddy` no longer exist as services — the dashboard image
+#     runs Caddy, the collector and its own database. An override naming them
+#     makes compose fail before anything starts.
+remove_override_file() {
   local override_file="$REPO_DIR/docker-compose.override.yml"
-
-  cat > "$override_file" <<EOF
-x-xnode-logging: &xnode-logging
-  driver: json-file
-  options:
-    max-size: "$LOG_MAX_SIZE"
-    max-file: "$LOG_MAX_FILE"
-
-services:
-  cpu:
-    logging: *xnode-logging
-EOF
-
-  cat >> "$override_file" <<'EOF'
-  quip-validator:
-    logging: *xnode-logging
-EOF
-
-  cat >> "$override_file" <<EOF
-    command:
-      - --chain=/etc/quip/chain-spec.json
-      - --base-path=/data
-      - --name=\${VALIDATOR_NAME:-quip-validator}
-      - --validator
-      - --state-pruning=$VALIDATOR_STATE_PRUNING
-      - --blocks-pruning=$VALIDATOR_BLOCKS_PRUNING
-      - --db-cache=$VALIDATOR_DB_CACHE_MB
-      - --rpc-port=9944
-      - --unsafe-rpc-external
-      - --rpc-cors=*
-      - --rpc-methods=safe
-      - --prometheus-port=9615
-      - --prometheus-external
-      - --no-mdns
-      - --unsafe-force-node-key-generation
-EOF
-
-  cat >> "$override_file" <<'EOF'
-  dashboard:
-    logging: *xnode-logging
-  postgres:
-    logging: *xnode-logging
-  caddy:
-    logging: *xnode-logging
-EOF
+  [[ -f "$override_file" ]] || return 0
+  say "Backup override: $(backup_override_file)"
+  rm -f "$override_file"
+  ok "docker-compose.override.yml удалён — новый стек настраивается через .env."
 }
 
 disable_faucet_in_config() {
@@ -1073,6 +1078,165 @@ chain_default_topology_present() {
   return 2
 }
 
+# --- Aglais migration -------------------------------------------------------
+#
+# Aglais replaced the previous Quip testnet on 2026-09-02 from a fresh genesis.
+# A stack built for the retired chain cannot join it and vice versa, and four
+# separate things break if an operator simply pulls and restarts:
+#
+#   1. `postgres` and `caddy` are no longer services — the dashboard image runs
+#      Caddy, the log collector and its own database. An old
+#      docker-compose.override.yml naming them makes compose fail outright.
+#   2. PUID/PGID of 0 are rejected; the dashboard image exits.
+#   3. The old override restated the validator `command:`, which replaces the
+#      whole list and drops --state-pruning=archive.
+#   4. The validator base path moved to data/aglais-chain-db. Aglais keeps the
+#      chain id `quip_testnet`, so reusing the old directory means the new spec
+#      opens the retired database and rejects it on a genesis mismatch.
+#
+# Nothing from the retired chain is deleted here. The old database and the old
+# dashboard volume stay until the operator removes them.
+
+# On Aglais the compose file gates the miner on `quip-validator` reporting
+# healthy, and healthy means synced to the chain head. So between a fresh
+# install and the end of the initial sync there is simply no miner container,
+# by design — not a fault, and nothing the watchdog should act on.
+validator_is_healthy() {
+  [[ "$(docker_cli inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' quip-validator 2>/dev/null || echo missing)" == "healthy" ]]
+}
+
+validator_sync_line() {
+  docker_cli logs --tail 40 quip-validator 2>&1 | grep -E "Syncing|Idle|Imported" | tail -1
+}
+
+# Genesis hash reported by an endpoint, or empty.
+chain_genesis() {
+  local endpoint body
+  endpoint="$(rpc_endpoint_http "${1:-$PUBLIC_RPC}")"
+  body="$(curl -fsS --max-time "${XNODE_RPC_TIMEOUT:-12}" \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"chain_getBlockHash","params":[0]}' \
+    "$endpoint" 2>/dev/null)" || return 1
+  printf '%s' "$body" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("result") or "")
+except Exception:
+    sys.exit(1)'
+}
+
+# Which network is this node actually on? Answers from the local validator, so
+# it reports what the node runs rather than what the config claims.
+node_network() {
+  local g
+  g="$(chain_genesis "$LOCAL_VALIDATOR" 2>/dev/null || true)"
+  case "$g" in
+    "$AGLAIS_GENESIS")  echo "aglais" ;;
+    "$RETIRED_GENESIS") echo "retired" ;;
+    "")                 echo "unknown" ;;
+    *)                  echo "other:$g" ;;
+  esac
+}
+
+# True when anything on disk still belongs to the pre-Aglais layout.
+needs_aglais_migration() {
+  local env_file="$REPO_DIR/.env"
+  local config_file="$REPO_DIR/data/config.toml"
+
+  [[ -f "$REPO_DIR/docker-compose.override.yml" ]] && return 0
+  [[ -f "$env_file" ]] && grep -Eq '^[[:space:]]*P(U|G)ID[[:space:]]*=[[:space:]]*0[[:space:]]*$' "$env_file" && return 0
+  [[ -f "$env_file" ]] && ! grep -Eq '^[[:space:]]*CHANNEL[[:space:]]*=' "$env_file" && return 0
+  [[ -f "$config_file" ]] && grep -q 'faucet.testnet.quip.network' "$config_file" && return 0
+  return 1
+}
+
+migrate_to_aglais() {
+  need_repo || return 1
+  local node_name cpu_count cpuset label wallet old_db old_vol
+
+  section "Переезд на Aglais"
+
+  if ! needs_aglais_migration; then
+    ok "Конфигурация уже в форме Aglais, миграция не нужна."
+    return 0
+  fi
+
+  warn "Старая сеть выведена из эксплуатации. Нода перейдёт на Aglais с нуля:"
+  warn "  - валидатор синхронизируется заново в data/$VALIDATOR_DIR_NAME;"
+  warn "  - майнер заново зарегистрируется через фаусет Aglais;"
+  warn "  - старая база и старый том дашборда НЕ удаляются."
+  echo
+
+  backup_keystore_file
+
+  # Stop everything first. The dashboard image now binds 20049/80/443/5514, and
+  # the retired stack's containers hold those ports until they are gone.
+  say "Останавливаю старый стек и снимаю осиротевшие контейнеры..."
+  compose down --remove-orphans || warn "down завершился с ошибкой, продолжаю."
+
+  remove_override_file
+
+  # Reuse what the operator already chose where it still makes sense.
+  label="$(config_read miner node_name 2>/dev/null || true)"
+  label="${label%% - 0x*}"
+  label="${NODE_LABEL:-${label:-xnode-quip}}"
+  cpu_count="$(config_read cpu num_cpus 2>/dev/null || true)"
+  [[ "$cpu_count" =~ ^[0-9]+$ ]] || cpu_count=1
+  cpuset="$(grep -E '^[[:space:]]*QUIP_MINER_CPUSET=' "$REPO_DIR/.env" 2>/dev/null | cut -d= -f2)"
+  cpuset="${cpuset:-$(default_cpuset)}"
+  wallet="${NODE_WALLET:-$(config_wallet_from_name)}"
+
+  node_name="$(compose_node_name "$label" "$wallet")"
+  say "node_name: $node_name"
+  if [[ -z "$wallet" ]]; then
+    warn "Кошелёк не задан — нода не будет привязана ни к какому аккаунту на платформе поинтов."
+    warn "Задать позже: ./xnode-quip.sh set-wallet 0xВашАдрес"
+  fi
+
+  write_env_file "$label" "$cpuset"
+  NODE_WALLET="$wallet" write_config_file "$node_name" "$cpu_count" "$LOCAL_VALIDATOR" "enabled"
+  ok ".env и data/config.toml переписаны под Aglais."
+
+  # Counters and heads recorded against the retired chain mean nothing now.
+  rm -f "$HEALTH_STATE_FILE"
+
+  say "Поднимаю новый стек..."
+  compose pull
+  compose up -d --remove-orphans
+
+  old_db="$(dir_size "$REPO_DIR/data/$RETIRED_VALIDATOR_DIR_NAME")"
+  old_vol="$(docker_cli volume ls --format '{{.Name}}' 2>/dev/null | grep -c 'pgdata' || true)"
+  echo
+  ok "Переезд выполнен. Валидатор синхронизирует Aglais с нуля — это занимает часы."
+  soft "Старая база: data/$RETIRED_VALIDATOR_DIR_NAME ($old_db). Удалить, когда убедишься, что всё работает:"
+  soft "  rm -rf $REPO_DIR/data/$RETIRED_VALIDATOR_DIR_NAME"
+  [[ "$old_vol" != "0" ]] && soft "  docker volume rm quip-pgdata   # старый индекс дашборда"
+}
+
+# Pull an 0x wallet back out of an existing node_name.
+config_wallet_from_name() {
+  local name
+  name="$(config_read miner node_name 2>/dev/null || true)"
+  grep -oE '0x[0-9a-fA-F]{40}' <<< "${name:-}" | head -n1
+}
+
+# set-wallet: change only the attribution, leave everything else alone.
+set_node_wallet() {
+  need_repo || return 1
+  local wallet="$1" label current
+  if [[ ! "$wallet" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+    fail "Это не похоже на EVM-адрес: $wallet"
+    fail "Ожидается 0x и 40 hex-символов."
+    return 1
+  fi
+  current="$(config_read miner node_name 2>/dev/null || true)"
+  label="${current%% - 0x*}"
+  label="${label:-xnode-quip}"
+  NODE_WALLET="$wallet" rewrite_config_file "$(current_config_validators)" "$(current_faucet_mode)" || return 1
+  ok "node_name: $(compose_node_name "$label" "$wallet")"
+  say "Перезапускаю miner, чтобы дескриптор ушёл в цепочку..."
+  restart_cpu_only
+}
+
 # --- Stall watchdog ---------------------------------------------------------
 #
 # The failure this catches, from two months of this node's own miner logs: the
@@ -1222,6 +1386,18 @@ miner_stall_check() {
   local last_progress last_action actions stalled_for progressed
 
   now="$(date -u +%s)"
+
+  # Compose gates the miner on the validator being synced. Until then there is
+  # no miner container on purpose, and its counters cannot move. Treat that as
+  # "not yet", not as a stall — otherwise every fresh install and every
+  # migration restarts a container that was never meant to be running.
+  if ! validator_is_healthy && [[ "$(miner_state)" != "running" ]]; then
+    if [[ "$mode" == "report" ]]; then
+      soft "Watchdog: майнер ещё не стартовал — ждёт синхронизации валидатора."
+    fi
+    return 0
+  fi
+
   reference="$(reference_head_number)"
 
   if [[ -z "$reference" ]]; then
@@ -1381,7 +1557,9 @@ validator_stall_check() {
   local last_progress last_action actions stalled_for cooldown
 
   # Nothing to judge unless the container is supposed to be up. A validator the
-  # operator stopped deliberately must stay stopped.
+  # operator stopped deliberately must stay stopped. Note this runs during the
+  # initial Aglais sync too, which is intended: a syncing validator advances
+  # its best block, so a flat one means wedged whether it is caught up or not.
   [[ "$(docker_cli inspect -f '{{.State.Status}}' quip-validator 2>/dev/null || echo missing)" == "running" ]] || return 0
 
   now="$(date -u +%s)"
@@ -1523,6 +1701,12 @@ show_health_status() {
   miner_stall_check report || true
 
   section "Watchdog: живость validator"
+  if validator_is_healthy; then
+    ok "Валидатор синхронизирован."
+  else
+    warn "Валидатор ещё синхронизируется — майнер намеренно не запущен до этого момента."
+    soft "  $(validator_sync_line)"
+  fi
   local vhead vactions
   vhead="$(validator_head_number 2>/dev/null || true)"
   vactions="$(health_state_get validator_actions)"
@@ -1585,6 +1769,16 @@ auto_recover_once() {
   chain_default_topology_present || topology_rc=$?
 
   if (( topology_rc == 0 )); then
+    # The miner is gated on the validator being synced. While that is true the
+    # container is absent on purpose, so starting it is pointless and judging
+    # it on progress would read a silent REST as a stall.
+    if ! validator_is_healthy; then
+      say "Валидатор ещё синхронизируется — майнер стартует сам, когда он догонит."
+      soft "  $(validator_sync_line)"
+      validator_stall_check act || true
+      return 0
+    fi
+
     # Container down (e.g. stopped earlier because topology was missing, and it
     # is back now) is the one case that needs a plain start rather than the
     # progress check, which would just read a silent REST.
@@ -2034,7 +2228,7 @@ switch_miner_rpc() {
   say "Backup config: $config_backup_file"
 
   ACTIVE_VALIDATORS="$validators"
-  write_override_file
+  remove_override_file
   set_config_validators "$validators"
   say "Override обновлён. Пересоздаю miner..."
 
@@ -2090,7 +2284,8 @@ install_node() {
   section "Установка / восстановление Quip CPU node"
   kv "Режим" "CPU miner, GPU не нужен"
   kv "Дашборд" "HTTP на :20049, домен не нужен"
-  kv "RPC miner" "по умолчанию public bootnodes, чтобы miner не ждал ресинк локального validator"
+  kv "Сеть" "Aglais (тестовая сеть Quip, spec 117)"
+  kv "RPC miner" "локальный validator — штатная конфигурация Aglais"
   kv "Локальный validator" "запускается pruned и синхронизируется в фоне"
   kv "Папка установки" "$BASE_DIR"
   kv "Основной repo" "$REPO_DIR"
@@ -2117,8 +2312,30 @@ install_node() {
   suggested_cpuset="$(default_cpuset)"
 
   section "Шаг 5/8: Профиль ноды"
-  read -r -p "Имя ноды [xnode-quip]: " node_name
+  read -r -p "Метка ноды [xnode-quip]: " node_name
   node_name="$(sanitize_name "${node_name:-xnode-quip}")"
+
+  # The wallet is what attributes the node to an operator account: it is
+  # published on chain inside the node descriptor as part of node_name, and
+  # the points platform reads it there. Without it the node earns for nobody,
+  # so ask before anything is written rather than leaving it to be discovered.
+  local wallet="$NODE_WALLET"
+  while [[ -z "$wallet" ]]; do
+    echo
+    say "EVM-кошелёк, на который засчитывать ноду (тот же, которым ты заходишь в Quip Points)."
+    say "Он уйдёт в цепочку в составе имени ноды — так платформа поинтов находит владельца."
+    read -r -p "Кошелёк 0x... (Enter — пропустить, нода будет ничьей): " wallet
+    if [[ -z "$wallet" ]]; then
+      warn "Без кошелька нода не привязана ни к какому аккаунту. Задать позже: ./xnode-quip.sh set-wallet 0x..."
+      break
+    fi
+    if [[ ! "$wallet" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+      fail "Не похоже на EVM-адрес (нужно 0x и 40 hex-символов). Попробуй ещё раз."
+      wallet=""
+    fi
+  done
+  NODE_WALLET="$wallet"
+  node_name="$(compose_node_name "$node_name" "$wallet")"
   say "Имя ноды: $node_name"
 
   read -r -p "CPU cpuset для miner [$suggested_cpuset]: " cpuset
@@ -2136,8 +2353,12 @@ install_node() {
     backup_keystore_file
   fi
 
-  validators="$PUBLIC_VALIDATORS"
-  say "RPC miner: $validators (public bootnodes, устойчиво при сбросе/ресинке validator)"
+  # Upstream default for Aglais: the miner talks to the bundled validator, and
+  # compose gates it on that validator reporting healthy. The dashboard needs
+  # the local archive node anyway, so pointing the miner elsewhere buys
+  # nothing here.
+  validators="$LOCAL_VALIDATOR"
+  say "RPC miner: $validators (локальный validator, штатная схема)"
   ACTIVE_VALIDATORS="$validators"
 
   section "Шаг 6/8: Конфигурация"
@@ -2148,7 +2369,7 @@ install_node() {
 
   write_env_file "$node_name" "$cpuset"
   write_config_file "$node_name" "$cpu_count" "$validators" "$faucet_mode"
-  write_override_file
+  remove_override_file
   ok ".env, config.toml и docker-compose.override.yml записаны"
 
   section "Шаг 7/8: Настройка хоста"
@@ -2200,10 +2421,10 @@ EOF
     1) compose logs --tail=160 cpu ;;
     2) compose logs --tail=160 quip-validator ;;
     3) compose logs --tail=160 dashboard ;;
-    4) compose logs --tail=160 caddy ;;
-    5) compose logs --tail=160 postgres ;;
-    6) compose logs --tail=120 cpu quip-validator dashboard caddy ;;
-    7) (cd "$REPO_DIR" && docker_cli compose logs --since=10m cpu quip-validator dashboard caddy | grep -Ei 'error|exception|traceback|panic|failed|warn|502|503' || true) ;;
+    4) compose logs --tail=160 dashboard ;;
+    5) tail -n 200 "$REPO_DIR/data/logs/quip-node.log" 2>/dev/null || warn "Объединённый лог ещё не создан." ;;
+    6) compose logs --tail=120 cpu quip-validator dashboard ;;
+    7) (cd "$REPO_DIR" && docker_cli compose logs --since=10m cpu quip-validator dashboard | grep -Ei 'error|exception|traceback|panic|failed|warn|502|503' || true) ;;
     8) compose logs -f --tail=80 cpu quip-validator ;;
     0) return ;;
     *) warn "Нет такого пункта." ;;
@@ -2354,7 +2575,8 @@ Notes:
   - Auto-recover can keep watching topology/miner health and restart the miner after Quip network updates.
   - Use menu item 10 or ./xnode-quip.sh check-updates to detect Git updates before applying them.
   - Use menu item 13 or ./xnode-quip.sh cleanup to inspect disk and prune old Docker leftovers.
-  - Use ./xnode-quip.sh validator-reset to recreate only validator DB with pruning when archive DB grows too much.
+  - Validator runs in archive mode; its database grows without bound by design. Size the disk for it.
+  - Use ./xnode-quip.sh validator-reset only to recover a corrupt DB — it costs a full resync.
 EOF
   chmod 600 "$SUMMARY_FILE"
   say "Summary saved: $SUMMARY_FILE"
@@ -2409,8 +2631,9 @@ disk_report() {
   kv "Root disk" "$(df -h "$SCRIPT_DIR" 2>/dev/null | awk 'NR==2 {print $3 " used / " $4 " free / " $5}')"
   kv "Install dir" "$BASE_DIR"
   kv "Quip repo" "$(dir_size "$REPO_DIR")"
-  kv "Validator DB" "$(dir_size "$REPO_DIR/data/validator-data")"
-  kv "Validator pruning" "state=$VALIDATOR_STATE_PRUNING blocks=$VALIDATOR_BLOCKS_PRUNING db-cache=${VALIDATOR_DB_CACHE_MB}MB"
+  kv "Validator DB" "$(dir_size "$REPO_DIR/data/$VALIDATOR_DIR_NAME")"
+  kv "Validator pruning" "archive (растёт без предела — это штатный режим)"
+  kv "Старая цепочка" "$(dir_size "$REPO_DIR/data/$RETIRED_VALIDATOR_DIR_NAME") в data/$RETIRED_VALIDATOR_DIR_NAME"
   kv "Miner runtime" "$(dir_size "$REPO_DIR/data/runtime")"
   kv "Quip logs dir" "$(dir_size "$REPO_DIR/data/logs")"
   kv "Docker dir" "$(dir_size /var/lib/docker)"
@@ -2438,7 +2661,7 @@ root_free_gb() {
 }
 
 validator_db_gb() {
-  path_size_gb "$REPO_DIR/data/validator-data"
+  path_size_gb "$REPO_DIR/data/$VALIDATOR_DIR_NAME"
 }
 
 current_config_validators() {
@@ -2478,7 +2701,7 @@ apply_log_limits_to_override() {
   local recreate="${1:-ask}"
 
   backup_override_file >/dev/null || true
-  write_override_file
+  remove_override_file
   ok "Лимит Docker logs записан в docker-compose.override.yml: max-size=$LOG_MAX_SIZE, max-file=$LOG_MAX_FILE"
 
   if [[ "$recreate" == "ask" ]]; then
@@ -2490,25 +2713,6 @@ apply_log_limits_to_override() {
   say "Применяю override и пересоздаю контейнеры..."
   compose up -d --force-recreate
   wait_for_miner 24 || true
-}
-
-apply_pruned_validator_override() {
-  need_repo || return
-  local recreate="${1:-ask}"
-
-  backup_override_file >/dev/null || true
-  write_override_file
-  ok "Override записан: validator pruning state=$VALIDATOR_STATE_PRUNING blocks=$VALIDATOR_BLOCKS_PRUNING db-cache=${VALIDATOR_DB_CACHE_MB}MB"
-
-  warn "Если текущая validator DB была создана как archive, один override не поможет: Substrate хранит pruning mode внутри DB."
-  warn "Для применения pruning к старой archive DB нужен пункт сброса validator DB."
-
-  if [[ "$recreate" == "ask" ]]; then
-    read -r -p "Пересоздать stack сейчас без удаления DB? [y/N]: " do_recreate || true
-    [[ "$do_recreate" =~ ^[Yy]$ ]] || return 0
-  fi
-
-  compose up -d
 }
 
 wait_for_validator_container() {
@@ -2538,13 +2742,13 @@ wait_for_validator_container() {
   return 1
 }
 
-reset_validator_db_pruned() {
+reset_validator_db() {
   need_repo || return
   local quiet="${1:-no}"
-  local validator_dir="$REPO_DIR/data/validator-data"
+  local validator_dir="$REPO_DIR/data/$VALIDATOR_DIR_NAME"
   local before_size
 
-  if [[ "$validator_dir" != "$REPO_DIR"/data/validator-data ]]; then
+  if [[ "$validator_dir" != "$REPO_DIR"/data/$VALIDATOR_DIR_NAME ]]; then
     fail "Safety check failed for validator dir: $validator_dir"
     return 1
   fi
@@ -2555,7 +2759,7 @@ reset_validator_db_pruned() {
   warn "Keystore майнера НЕ трогаю: $REPO_DIR/data/keystore.json"
   warn "После сброса validator начнёт синхронизацию заново, но база больше не будет archive."
   kv "Текущий размер" "$before_size"
-  kv "Новый pruning" "state=$VALIDATOR_STATE_PRUNING blocks=$VALIDATOR_BLOCKS_PRUNING db-cache=${VALIDATOR_DB_CACHE_MB}MB"
+  kv "Режим после сброса" "archive (как требует апстрим)"
 
   if [[ "$quiet" != "yes" ]]; then
     read -r -p "Напиши YES чтобы удалить validator DB и пересоздать её: " confirm || true
@@ -2567,7 +2771,7 @@ reset_validator_db_pruned() {
   fi
 
   backup_override_file >/dev/null || true
-  write_override_file
+  remove_override_file
 
   say "Останавливаю validator/dashboard/caddy..."
   compose stop quip-validator dashboard caddy >/dev/null 2>&1 || true
@@ -2592,7 +2796,7 @@ safe_disk_cleanup() {
   local quiet="${1:-no}"
 
   section "Безопасная очистка диска"
-  warn "Эта очистка НЕ удаляет keystore, validator-data, postgres volume и рабочую chain database."
+  warn "Эта очистка НЕ удаляет keystore, базу валидатора и данные дашборда."
   echo
   say "До очистки"
   docker_cli system df 2>/dev/null || true
@@ -2620,12 +2824,16 @@ storage_guard_auto() {
   free_gb="$(root_free_gb)"
 
   echo
-  say "Storage guard: validator_db=${size_gb}G, root_free=${free_gb}G, threshold=${VALIDATOR_RESET_THRESHOLD_GB}G"
-  if (( size_gb >= VALIDATOR_RESET_THRESHOLD_GB || free_gb < 12 )); then
-    warn "Validator DB слишком большая или свободного места мало. Запускаю автоматический сброс validator DB."
-    reset_validator_db_pruned "yes"
+  say "Storage guard: validator_db=${size_gb}G, root_free=${free_gb}G"
+  # Deliberately no automatic reset. The archive database grows without bound
+  # by design, so "large" is not a fault, and wiping it costs a full resync
+  # plus the dashboard index. It used to fire below 12G free and would have
+  # destroyed a 32G database on two nodes without asking.
+  if (( free_gb < 12 )); then
+    warn "Свободно меньше 12G. Автоматический сброс НЕ выполняется — archive DB это штатный режим."
+    warn "Реши вручную: расширить диск, либо ./xnode-quip.sh validator-reset (полный ресинк)."
   else
-    ok "Сброс validator DB не нужен."
+    ok "Места достаточно."
   fi
 }
 
@@ -2705,7 +2913,7 @@ EOF
   $SUDO systemctl enable "$cleanup_timer_name" >/dev/null
   $SUDO systemctl restart "$cleanup_timer_name"
   ok "Автоочистка включена: $cleanup_timer_name"
-  soft "Каждый день чистятся Docker leftovers. Если validator DB превысит ${VALIDATOR_RESET_THRESHOLD_GB}G или места станет меньше 12G, она будет пересоздана с pruning."
+  soft "Каждый день чистятся Docker leftovers. Validator DB не сбрасывается автоматически — при нехватке места скрипт только предупредит."
   [[ "$quiet" == "yes" ]] || pause
 }
 
@@ -2752,9 +2960,9 @@ EOF
     read -r -p "Выбор: " choice
     case "$choice" in
       1) safe_disk_cleanup ;;
-      2) apply_pruned_validator_override "ask"; pause ;;
+      2) logo; disk_report; pause ;;
       3) truncate_docker_logs ;;
-      4) reset_validator_db_pruned ;;
+      4) reset_validator_db ;;
       5) storage_guard_auto; pause ;;
       6) install_cleanup_timer ;;
       7) disable_cleanup_timer ;;
@@ -2773,7 +2981,7 @@ diagnostics() {
   echo
   say "Restart counters"
   docker_cli inspect --format '{{.Name}} restart={{.RestartCount}} state={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
-    quip-cpu quip-validator quip-dashboard quip-postgres quip-caddy 2>/dev/null || true
+    quip-cpu quip-validator quip-dashboard 2>/dev/null || true
   echo
   say "Miner status"
   local miner_status_ok="no"
@@ -2835,7 +3043,7 @@ diagnostics() {
   done
   echo
   say "Resource usage"
-  docker_cli stats --no-stream quip-cpu quip-validator quip-dashboard quip-postgres quip-caddy 2>/dev/null || true
+  docker_cli stats --no-stream quip-cpu quip-validator quip-dashboard 2>/dev/null || true
   echo
   disk_report
   pause
@@ -2861,7 +3069,7 @@ restart_node() {
   migrate_env_tags
   migrate_env_mem_limit
   migrate_config_v03 || warn "Миграция config.toml не удалась, проверь data/config.toml вручную."
-  migrate_override_file
+  remove_override_file
 
   say "Перезапускаю stack..."
   compose up -d --force-recreate
@@ -2915,10 +3123,17 @@ update_node() {
   section "Миграция конфигурации"
   migrate_env_tags
   migrate_env_mem_limit
+  if needs_aglais_migration; then
+    migrate_to_aglais || { fail "Переезд на Aglais не удался."; return 1; }
+    write_summary || true
+    say "Update завершён переездом на Aglais."
+    [[ "$confirm" == "ask" ]] && pause
+    return 0
+  fi
   # Order matters here too: migrate_config_v03 reads the override's legacy
   # faucet marker, so the override is rewritten only afterwards.
   migrate_config_v03 || warn "Миграция config.toml не удалась, проверь data/config.toml вручную."
-  migrate_override_file
+  remove_override_file
 
   section "Docker images"
   compose pull
@@ -3037,6 +3252,9 @@ case "${1:-menu}" in
   auto-recover) auto_recover_once ;;
   auto-recover-status) auto_recover_status_cli ;;
   health) logo; show_health_status ;;
+  migrate-aglais) logo; migrate_to_aglais; write_summary || true ;;
+  set-wallet) logo; set_node_wallet "${2:-}" ;;
+  network) logo; kv "Сеть ноды" "$(node_network)"; kv "Aglais genesis" "$AGLAIS_GENESIS" ;;
   auto-recover-install) install_auto_recover_timer "yes" ;;
   auto-recover-disable) disable_auto_recover_timer "yes" ;;
   restart) restart_node ;;
@@ -3050,9 +3268,8 @@ case "${1:-menu}" in
   cleanup-disable) disable_cleanup_timer "yes" ;;
   log-limits) apply_log_limits_to_override "ask" ;;
   storage-guard) logo; storage_guard_auto ;;
-  validator-prune-override) apply_pruned_validator_override "ask" ;;
-  validator-reset) logo; reset_validator_db_pruned ;;
+  validator-reset) logo; reset_validator_db ;;
   rpc-local) switch_miner_rpc local ;;
   rpc-public) switch_miner_rpc public ;;
-  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|health|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|storage-guard|validator-prune-override|validator-reset|rpc-local|rpc-public]"; exit 1 ;;
+  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|health|migrate-aglais|set-wallet <0x…>|network|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|storage-guard|validator-reset|rpc-local|rpc-public]"; exit 1 ;;
 esac

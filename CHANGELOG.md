@@ -1,5 +1,75 @@
 # Changelog
 
+## 2.00
+
+Migrates the node to **Aglais**, the Quip test network that replaced the
+previous testnet on 2026-09-02 from a fresh genesis. A spec-116 stack cannot
+join Aglais and a spec-117 stack cannot join the retired chain, so this is a
+one-way move. Nodes left on the old chain keep mining something that is being
+retired.
+
+Running the previous installer's `update` against the current upstream would
+not have produced a working node. Four things break at once:
+
+- `postgres` and `caddy` no longer exist as services — the dashboard image now
+  runs Caddy, the syslog collector and its own database. The override this
+  installer used to write names both, and compose fails before anything starts.
+  The override is now deleted rather than rewritten: everything it carried
+  lives in the base compose file.
+- `PUID`/`PGID` of `0` are rejected; the dashboard image exits. The installer
+  wrote zeros. It now writes 1000.
+- The old override restated the validator `command:`, and a restated command
+  replaces the whole list — silently dropping `--state-pruning=archive`.
+  Archive is the supported mode: pruning breaks the dashboard's descriptor
+  worker with `State already discarded`, and upstream states it likely reduces
+  point awards. All pruning options are gone from this installer.
+- The validator base path moved to `data/aglais-chain-db`. Aglais keeps the
+  chain id `quip_testnet`, so reusing the old directory means the new spec
+  opens the retired database and rejects it on a genesis mismatch.
+
+### The node name is what links a node to an operator account
+
+`[miner].node_name` is published on chain inside the node descriptor, and the
+points platform reads it there. This is the only link between a running node
+and an account — nothing else carries it. Of 4803 node descriptors indexed
+from the retired chain, 4610 carry an EVM address in that field and 4460 use
+the exact form `Label - 0xADDRESS`.
+
+The installer now asks for the wallet during install and refuses malformed
+input, composes `node_name` as `Label - 0xADDRESS`, and preserves the pairing
+across every config rewrite. `./xnode-quip.sh set-wallet 0x…` changes the
+attribution on an existing node and restarts the miner so the descriptor is
+republished. A node installed without a wallet warns that it earns for nobody.
+
+### Channel, not tags
+
+Images now follow `CHANNEL` rather than per-image pins. The installer writes
+`CHANNEL=beta`, which is upstream's own default and the only channel
+consistent with the repo's main branch: the dashboard's `stable` tag is still
+the Postgres-backed build and exits with `DATABASE_URL is required` against
+the embedded-dashboard compose file. `latest` is pre-Aglais and must never be
+used. Override with `XNODE_CHANNEL`.
+
+### Other
+
+- Added `migrate-aglais`, `set-wallet <0x…>` and `network` commands. `update`
+  runs the migration automatically when it detects a pre-Aglais layout.
+- The watchdog understands that compose gates the miner on the validator being
+  synced. During the initial sync there is no miner container by design, and
+  the watchdog no longer reads that as a stall.
+- Migrating clears the watchdog's recorded counters, which referred to the
+  retired chain.
+- The storage guard no longer resets the validator database on its own. The
+  archive database grows without bound by design, so size is not a fault, and
+  the old rule fired below 12 GB free — it would have destroyed a 32 GB
+  database on two nodes without asking. It now only warns.
+- Removed `validator-prune-override`. `validator-reset` keeps archive mode and
+  is for recovering a corrupt database, not for reclaiming disk.
+- The logs menu drops the `caddy` and `postgres` entries and gains the merged
+  stack log at `data/logs/quip-node.log`.
+- Nothing from the retired chain is deleted: `data/validator-data` and the old
+  dashboard volume stay until the operator removes them.
+
 ## 1.04
 
 - `./xnode-quip.sh update` exited 1 after a completely successful update. The
