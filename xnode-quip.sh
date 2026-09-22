@@ -2074,12 +2074,22 @@ short_status() {
     ' /tmp/xnode-quip-status.json 2>/dev/null || true
     kv "rpc" "$(active_rpc_url 2>/dev/null || echo unknown)"
   else
-    warn "Miner REST пока не отвечает."
-    if topology_blocker_seen; then
-      warn "Причина по последним логам: missing QuantumPow.DefaultTopology на chain."
-      print_auto_recover_hint
-    elif faucet_blocker_seen; then
-      warn "Похоже, причина в funding: public faucet возвращает ошибку, кошелёк ещё без стартовых QUIP."
+    # Order matters. While the validator is still catching up the miner is down
+    # on purpose, and any funding or topology line still sitting in its log is
+    # from an earlier attempt — reporting those first turns a normal initial
+    # sync into what looks like a broken node.
+    if ! validator_is_healthy; then
+      say "Майнер ещё не запущен: ждёт, пока валидатор догонит сеть. Это штатно."
+      soft "  $(validator_sync_line)"
+      soft "  Старт произойдёт сам, watchdog проверяет каждые 5 минут."
+    else
+      warn "Miner REST пока не отвечает."
+      if topology_blocker_seen; then
+        warn "Причина по последним логам: missing QuantumPow.DefaultTopology на chain."
+        print_auto_recover_hint
+      elif faucet_blocker_seen; then
+        warn "Похоже, причина в funding: фаусет Aglais не выдал стартовые AGLS."
+      fi
     fi
   fi
   echo
