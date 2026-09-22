@@ -490,7 +490,7 @@ QUIP_MINER_CPUSET=$cpuset
 # Sized from this host's RAM. The compose default (16g) sits above total
 # memory on a smaller box, which turns the cap off exactly where it matters.
 QUIP_MINER_MEM_LIMIT=$(default_miner_mem_limit)
-VALIDATOR_NAME=$node_name-validator
+VALIDATOR_NAME=$(compose_validator_name "$node_name")
 EOF
 }
 
@@ -597,6 +597,20 @@ compose_node_name() {
   else
     echo "$label"
   fi
+}
+
+# Substrate rejects a --name longer than 64 bytes and refuses to start. Since
+# node_name now carries a 42-character wallet, "<label> - <wallet>-validator"
+# overflows that on any realistic label, so strip the wallet back off and cap
+# what is left. This name is telemetry display only and has no bearing on
+# attribution, which lives in [miner].node_name.
+compose_validator_name() {
+  local name="${1:-xnode-quip}"
+  name="${name%% - 0x*}"
+  name="$(sed -E 's/[[:space:]]*0x[0-9a-fA-F]{40}[[:space:]]*//g' <<< "$name")"
+  name="$(sanitize_name "$name")"
+  name="${name:0:40}"
+  echo "${name:-xnode-quip}-validator"
 }
 
 write_config_file() {
@@ -2378,19 +2392,37 @@ install_node() {
   section "Шаг 8/8: Запуск Docker stack"
   start_stack
 
+  # On a fresh Aglais install the validator syncs from genesis first, and
+  # compose keeps the miner down until it reports healthy. That takes longer
+  # than any sensible wait here, so a miner that has not appeared yet is the
+  # expected state, not a failure.
+  if ! validator_is_healthy; then
+    section "Установка завершена"
+    ok "Стек поднят. Валидатор синхронизирует Aglais с нуля."
+    soft "  $(validator_sync_line)"
+    say "Майнер стартует сам, как только валидатор догонит сеть — вмешиваться не нужно."
+    install_auto_recover_timer "yes" || true
+    write_summary
+    show_dashboard_info
+    pause
+    return 0
+  fi
+
   if wait_for_miner 72; then
-    disable_faucet_in_config
-    say "Faucet отключён в override для будущих restart/update."
+    # The faucet is NOT disabled here any more. On Aglais the coordinator asks
+    # it only when the balance falls below the submit-fee threshold, and it
+    # refuses to start on an underfunded account with no faucet configured —
+    # so switching it off after a good start is how a node breaks weeks later.
+    install_auto_recover_timer "yes" || true
     write_summary
     section "Установка завершена"
     show_dashboard_info
     show_wallet_info "no-secret"
   else
     if faucet_blocker_seen; then
-      warn "Установка Docker stack выполнена, но public faucet не выдал стартовые QUIP. Это внешний funding-блокер, см. пункт 6: Полная диагностика."
+      warn "Стек поднят, но фаусет Aglais не выдал стартовые AGLS. Это внешний блокер, см. пункт 6: Полная диагностика."
     elif topology_blocker_seen; then
-      warn "Установка Docker stack выполнена, wallet funded/registered, но в testnet отсутствует QuantumPow.DefaultTopology."
-      warn "Miner остановлен, чтобы не тратить баланс на crash-loop. Проверяй пункт 6: Полная диагностика."
+      warn "Стек поднят, аккаунт зарегистрирован, но на chain нет QuantumPow.DefaultTopology."
       stop_cpu_only
       install_auto_recover_timer "yes" || true
     else
