@@ -1228,6 +1228,7 @@ migrate_to_aglais() {
   # leave it to the watchdog instead of blocking here for the whole resync.
   compose up -d --remove-orphans quip-validator dashboard
   install_auto_recover_timer "yes" || true
+  install_cleanup_timer "yes" || true
 
   old_db="$(dir_size "$REPO_DIR/data/$RETIRED_VALIDATOR_DIR_NAME")"
   old_vol="$(docker_cli volume ls --format '{{.Name}}' 2>/dev/null | grep -c 'pgdata' || true)"
@@ -2424,6 +2425,7 @@ install_node() {
     soft "  $(validator_sync_line)"
     say "Майнер стартует сам, как только валидатор догонит сеть — вмешиваться не нужно."
     install_auto_recover_timer "yes" || true
+    install_cleanup_timer "yes" || true
     write_summary
     show_dashboard_info
     pause
@@ -2856,12 +2858,23 @@ safe_disk_cleanup() {
   docker_cli system df 2>/dev/null || true
   echo
 
-  say "Удаляю dangling Docker images (<none>)..."
-  docker_cli image prune -f || true
+  # -a, not just dangling: every pull of a moving tag (CHANNEL=beta) leaves the
+  # previous version behind, ~2 GB per update, and `prune -f` alone never
+  # reclaimed it. Images referenced by any container — running or stopped,
+  # including a miner parked while the validator syncs — are kept by Docker.
+  say "Удаляю Docker-образы, которые не использует ни один контейнер (старые версии)..."
+  docker_cli image prune -af || true
   echo
 
   say "Удаляю Docker build cache старше 24 часов..."
   docker_cli builder prune -f --filter until=24h || true
+  echo
+
+  say "Ограничиваю системный журнал (journald) до 200 МБ..."
+  $SUDO journalctl --vacuum-size=200M >/dev/null 2>&1 || true
+
+  say "Чищу кэш пакетов apt..."
+  $SUDO apt-get clean >/dev/null 2>&1 || true
   echo
 
   say "После очистки"
