@@ -854,10 +854,19 @@ apply_sysctl_tuning() {
   fi
 }
 
+# Bring up the validator and the dashboard only. The miner is declared with
+# depends_on: quip-validator: condition: service_healthy, and healthy means
+# synced to the chain head — so a plain `compose up -d` blocks, silently, for
+# the whole initial sync (30-60 minutes on Aglais). An operator who takes that
+# for a hang and presses Ctrl+C leaves the miner in "Created" for good, before
+# the watchdog that would have started it has been installed. Starting the two
+# gate-free services returns at once; the watchdog starts the miner as soon as
+# the validator reports healthy.
 start_stack() {
-  say "Тяну образы и запускаю CPU stack..."
+  say "Тяну образы и запускаю validator + dashboard..."
   compose pull
-  compose up -d
+  compose up -d --remove-orphans quip-validator dashboard
+  soft "Майнер стартует автоматически, когда валидатор догонит сеть (watchdog, проверка каждые 5 минут)."
 }
 
 restart_cpu_only() {
@@ -1215,7 +1224,10 @@ migrate_to_aglais() {
 
   say "Поднимаю новый стек..."
   compose pull
-  compose up -d --remove-orphans
+  # Same reasoning as start_stack: the miner waits for a synced validator, so
+  # leave it to the watchdog instead of blocking here for the whole resync.
+  compose up -d --remove-orphans quip-validator dashboard
+  install_auto_recover_timer "yes" || true
 
   old_db="$(dir_size "$REPO_DIR/data/$RETIRED_VALIDATOR_DIR_NAME")"
   old_vol="$(docker_cli volume ls --format '{{.Name}}' 2>/dev/null | grep -c 'pgdata' || true)"
