@@ -879,8 +879,22 @@ stop_cpu_only() {
   compose stop cpu >/dev/null 2>&1 || true
 }
 
+# The dashboard image hosts the :20049 front door. When the dashboard is turned
+# off (see disable_dashboard) the miner REST is published on 127.0.0.1:8086
+# instead, so try the front door first and fall back to the direct port.
 status_json() {
-  curl -fsS --max-time 5 http://localhost:20049/api/v1/status
+  curl -fsS --max-time 5 http://localhost:20049/api/v1/status 2>/dev/null \
+    || curl -fsS --max-time 5 http://127.0.0.1:8086/api/v1/status
+}
+
+# Same for the validator RPC: front door when the dashboard runs, otherwise
+# the port published on loopback.
+local_rpc_http() {
+  if docker_cli ps --format '{{.Names}}' 2>/dev/null | grep -qx quip-dashboard; then
+    echo "$LOCAL_RPC_HTTP"
+  else
+    echo "http://127.0.0.1:9944"
+  fi
 }
 
 # The v0.2 status payload carried modes.cpu.controller.active_url; the v0.3
@@ -978,7 +992,7 @@ rpc_endpoint_http() {
   case "$url" in
     # ws://quip-validator:9944 is a compose-network address the host cannot
     # dial; Caddy fronts the same RPC on the published dashboard port.
-    ws://quip-validator:*|ws://127.0.0.1:*|ws://localhost:*) echo "$LOCAL_RPC_HTTP" ;;
+    ws://quip-validator:*|ws://127.0.0.1:*|ws://localhost:*) local_rpc_http ;;
     wss://*) echo "https://${url#wss://}" ;;
     ws://*)  echo "http://${url#ws://}" ;;
     *)       echo "$url" ;;
@@ -1165,7 +1179,10 @@ needs_aglais_migration() {
   local env_file="$REPO_DIR/.env"
   local config_file="$REPO_DIR/data/config.toml"
 
-  [[ -f "$REPO_DIR/docker-compose.override.yml" ]] && return 0
+  # Only an override from the pre-Aglais stack counts. The dashboard-off
+  # override written by disable_dashboard is current and must survive.
+  [[ -f "$REPO_DIR/docker-compose.override.yml" ]] \
+    && grep -Eq '^[[:space:]]*(postgres|caddy):|QUIP_VALIDATORS|state-pruning' "$REPO_DIR/docker-compose.override.yml" && return 0
   [[ -f "$env_file" ]] && grep -Eq '^[[:space:]]*P(U|G)ID[[:space:]]*=[[:space:]]*0[[:space:]]*$' "$env_file" && return 0
   [[ -f "$env_file" ]] && ! grep -Eq '^[[:space:]]*CHANNEL[[:space:]]*=' "$env_file" && return 0
   [[ -f "$config_file" ]] && grep -q 'faucet.testnet.quip.network' "$config_file" && return 0
@@ -1262,6 +1279,66 @@ set_node_wallet() {
   ok "node_name: $(compose_node_name "$label" "$wallet")"
   say "Перезапускаю miner, чтобы дескриптор ушёл в цепочку..."
   restart_cpu_only
+}
+
+# --- Dashboard off ----------------------------------------------------------
+#
+# The dashboard's own index (dashboard-data/dashboard.db) grows ~2.5-3 GB a day
+# per node, several times faster than the validator's archive database, and on
+# a 50 GB VM it is what fills the disk within about a week. Nothing in mining
+# or point attribution reads it. Turning it off means:
+#   * the dashboard service is moved to a profile nobody enables, so neither
+#     `compose up` nor the watchdog brings it back;
+#   * the miner REST (8086) and validator RPC (9944) are published on
+#     127.0.0.1 only, so the watchdog can still see both without the :20049
+#     front door the dashboard image used to provide;
+#   * its index is deleted to give the space back.
+disable_dashboard() {
+  need_repo || return 1
+  local override_file="$REPO_DIR/docker-compose.override.yml"
+  local freed
+  cat > "$override_file" <<'EOF'
+# Written by XNODE: dashboard off. See disable_dashboard in xnode-quip.sh.
+services:
+  dashboard:
+    profiles: ["dashboard-off"]
+  cpu:
+    ports:
+      - "127.0.0.1:8086:8086"
+  quip-validator:
+    ports:
+      - "127.0.0.1:9944:9944"
+EOF
+  docker_cli rm -f quip-dashboard >/dev/null 2>&1 || true
+  compose up -d --remove-orphans quip-validator cpu
+  freed="$(du -sh "$REPO_DIR/dashboard-data/dashboard.db" 2>/dev/null | cut -f1)"
+  rm -f "$REPO_DIR"/dashboard-data/dashboard.db "$REPO_DIR"/dashboard-data/dashboard.db-wal "$REPO_DIR"/dashboard-data/dashboard.db-shm
+  ok "Дашборд выключен, индекс удалён (освобождено ${freed:-0})."
+}
+
+# A recreate can die halfway: Docker refuses to remove a container that is still
+# shutting down ("cannot remove container"), compose aborts, and what is left is
+# the old container stopped plus a new one parked in "Created" under a
+# <hash>_<name> alias. Clear those before every recreate. And never pull here:
+# with pull_policy: always a recovery would first download whatever the moving
+# tag points at now, which on a CPU-capped VM takes minutes and widens exactly
+# the window in which the recreate gets interrupted.
+clean_stale_containers() {
+  local name="$1" id
+  for id in $(docker_cli ps -aq --filter "name=_${name}\$" --filter status=created --filter status=exited 2>/dev/null); do
+    docker_cli rm -f "$id" >/dev/null 2>&1 && say "Убран недособранный контейнер ${id:0:12} (${name})."
+  done
+}
+
+recreate_service() {
+  local svc="$1" ctr="$2"
+  clean_stale_containers "$ctr"
+  if ! compose up -d --pull never --force-recreate --no-deps "$svc"; then
+    warn "Пересоздание $svc не удалось с первого раза — убираю остатки и пробую снова."
+    docker_cli rm -f "$ctr" >/dev/null 2>&1 || true
+    clean_stale_containers "$ctr"
+    compose up -d --pull never --no-deps "$svc"
+  fi
 }
 
 # --- Stall watchdog ---------------------------------------------------------
@@ -1395,11 +1472,12 @@ recover_miner_escalate() {
       ;;
     2)
       say "Уровень 2: пересоздаю miner контейнер."
-      compose up -d --force-recreate --no-deps cpu
+      recreate_service cpu quip-cpu
       ;;
     *)
       say "Уровень 3: пересоздаю весь stack."
-      compose up -d --force-recreate
+      clean_stale_containers quip-cpu; clean_stale_containers quip-validator
+      compose up -d --pull never --force-recreate --no-deps quip-validator cpu
       ;;
   esac
 }
@@ -1587,7 +1665,18 @@ validator_stall_check() {
   # operator stopped deliberately must stay stopped. Note this runs during the
   # initial Aglais sync too, which is intended: a syncing validator advances
   # its best block, so a flat one means wedged whether it is caught up or not.
-  [[ "$(docker_cli inspect -f '{{.State.Status}}' quip-validator 2>/dev/null || echo missing)" == "running" ]] || return 0
+  # One exception: the miner still running while the validator is not is a
+  # failed recovery or a crash, not an operator decision — `stop` takes both
+  # down together. Left alone, that state lasted an hour on one node because
+  # this check used to treat any stopped validator as deliberate.
+  if [[ "$(docker_cli inspect -f '{{.State.Status}}' quip-validator 2>/dev/null || echo missing)" != "running" ]]; then
+    if [[ "$mode" != "report" ]] && [[ "$(docker_cli inspect -f '{{.State.Status}}' quip-cpu 2>/dev/null)" == "running" ]]; then
+      bad "Validator не запущен, а майнер работает — это сбой. Поднимаю validator."
+      clean_stale_containers quip-validator
+      compose up -d --pull never --no-deps quip-validator
+    fi
+    return 0
+  fi
 
   now="$(date -u +%s)"
   reference="$(public_head_number 2>/dev/null || true)"
@@ -1672,7 +1761,7 @@ validator_stall_check() {
     compose restart quip-validator
   elif (( actions == 2 )); then
     say "Уровень 2: пересоздаю validator."
-    compose up -d --force-recreate --no-deps quip-validator
+    recreate_service quip-validator quip-validator
   else
     # Deliberately not automatic: recreating the database throws away hours of
     # sync, and a validator that will not run after two restarts usually means
@@ -3321,6 +3410,7 @@ case "${1:-menu}" in
   health) logo; show_health_status ;;
   migrate-aglais) logo; migrate_to_aglais; write_summary || true ;;
   set-wallet) logo; set_node_wallet "${2:-}" ;;
+  dashboard-off) logo; disable_dashboard ;;
   network) logo; kv "Сеть ноды" "$(node_network)"; kv "Aglais genesis" "$AGLAIS_GENESIS" ;;
   auto-recover-install) install_auto_recover_timer "yes" ;;
   auto-recover-disable) disable_auto_recover_timer "yes" ;;
