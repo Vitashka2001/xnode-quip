@@ -1283,10 +1283,16 @@ set_node_wallet() {
 
 # --- Dashboard off ----------------------------------------------------------
 #
+# WARNING: measured on the Aglais fleet, nodes with the dashboard off earned
+# ~35% fewer node points (+165/day vs +260/day). The dashboard container is
+# also the :20049 front door that publishes /api/v1 (miner status) and
+# /files/qblocks to the outside, and the points platform evidently checks it.
+# Prefer keeping the dashboard and trimming its index (trim_dashboard_index);
+# dashboard-on undoes this.
+#
 # The dashboard's own index (dashboard-data/dashboard.db) grows ~2.5-3 GB a day
 # per node, several times faster than the validator's archive database, and on
-# a 50 GB VM it is what fills the disk within about a week. Nothing in mining
-# or point attribution reads it. Turning it off means:
+# a 50 GB VM it is what fills the disk within about a week. Turning it off means:
 #   * the dashboard service is moved to a profile nobody enables, so neither
 #     `compose up` nor the watchdog brings it back;
 #   * the miner REST (8086) and validator RPC (9944) are published on
@@ -1314,6 +1320,54 @@ EOF
   freed="$(du -sh "$REPO_DIR/dashboard-data/dashboard.db" 2>/dev/null | cut -f1)"
   rm -f "$REPO_DIR"/dashboard-data/dashboard.db "$REPO_DIR"/dashboard-data/dashboard.db-wal "$REPO_DIR"/dashboard-data/dashboard.db-shm
   ok "Дашборд выключен, индекс удалён (освобождено ${freed:-0})."
+  warn "Без дашборда нода не видна снаружи на :20049 и получает меньше поинтов. Вернуть: $0 dashboard-on"
+}
+
+# Undo disable_dashboard: keep the loopback ports the watchdog may rely on, drop
+# the profile that hid the dashboard, and start only the dashboard, so the miner
+# and validator are not recreated.
+enable_dashboard() {
+  need_repo || return 1
+  local override_file="$REPO_DIR/docker-compose.override.yml"
+  if [[ -f "$override_file" ]] && grep -q 'dashboard-off' "$override_file"; then
+    cat > "$override_file" <<'EOF'
+# Written by XNODE: dashboard on. See enable_dashboard in xnode-quip.sh.
+services:
+  cpu:
+    ports:
+      - "127.0.0.1:8086:8086"
+  quip-validator:
+    ports:
+      - "127.0.0.1:9944:9944"
+EOF
+  fi
+  compose up -d --no-deps dashboard || return 1
+  ok "Дашборд включён, :20049 снова отвечает снаружи."
+}
+
+# The index is a cache: the dashboard rebuilds it from the chain and is healthy
+# again within ~10 minutes of a wipe, while the :20049 front door is back as
+# soon as the container starts. Mining and the published qblock files do not
+# depend on it. Wiping it once it passes DASHBOARD_DB_MAX_GB keeps a 50 GB VM
+# from filling up without giving up the front door. force=yes wipes regardless.
+DASHBOARD_DB_MAX_GB="${DASHBOARD_DB_MAX_GB:-4}"
+
+trim_dashboard_index() {
+  local force="${1:-no}" db="$REPO_DIR/dashboard-data/dashboard.db" size_gb
+  need_repo || return 1
+  docker_cli ps --format '{{.Names}}' 2>/dev/null | grep -qx quip-dashboard || return 0
+  [[ -f "$db" ]] || return 0
+  size_gb="$(path_size_gb "$db")"
+  if [[ "$force" != "yes" ]] && (( size_gb < DASHBOARD_DB_MAX_GB )); then
+    say "Индекс дашборда ${size_gb}G (порог ${DASHBOARD_DB_MAX_GB}G) — не трогаю."
+    return 0
+  fi
+  say "Индекс дашборда ${size_gb}G — очищаю (дашборд пересоберёт его сам)."
+  docker_cli stop -t 60 quip-dashboard >/dev/null 2>&1 || true
+  rm -f "$db" "$db-wal" "$db-shm"
+  docker_cli start quip-dashboard >/dev/null 2>&1 \
+    || compose up -d --pull never --no-deps dashboard
+  ok "Индекс дашборда очищен, свободно $(root_free_gb)G."
 }
 
 # A recreate can die halfway: Docker refuses to remove a container that is still
@@ -2976,6 +3030,7 @@ storage_guard_auto() {
   local size_gb free_gb
 
   safe_disk_cleanup "yes"
+  trim_dashboard_index
   size_gb="$(validator_db_gb)"
   free_gb="$(root_free_gb)"
 
@@ -3411,6 +3466,8 @@ case "${1:-menu}" in
   migrate-aglais) logo; migrate_to_aglais; write_summary || true ;;
   set-wallet) logo; set_node_wallet "${2:-}" ;;
   dashboard-off) logo; disable_dashboard ;;
+  dashboard-on) logo; enable_dashboard ;;
+  dashboard-trim) logo; trim_dashboard_index "yes" ;;
   network) logo; kv "Сеть ноды" "$(node_network)"; kv "Aglais genesis" "$AGLAIS_GENESIS" ;;
   auto-recover-install) install_auto_recover_timer "yes" ;;
   auto-recover-disable) disable_auto_recover_timer "yes" ;;
@@ -3428,5 +3485,5 @@ case "${1:-menu}" in
   validator-reset) logo; reset_validator_db ;;
   rpc-local) switch_miner_rpc local ;;
   rpc-public) switch_miner_rpc public ;;
-  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|health|migrate-aglais|set-wallet <0x…>|network|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|storage-guard|validator-reset|rpc-local|rpc-public]"; exit 1 ;;
+  *) echo "Usage: $0 [menu|install|preflight|logs|dashboard|dashboard-on|dashboard-off|dashboard-trim|wallet|status|ports|backup|auto-recover|auto-recover-status|auto-recover-install|auto-recover-disable|health|migrate-aglais|set-wallet <0x…>|network|restart|stop|check-updates|update|cleanup|cleanup-auto|cleanup-status|cleanup-install|cleanup-disable|log-limits|storage-guard|validator-reset|rpc-local|rpc-public]"; exit 1 ;;
 esac
