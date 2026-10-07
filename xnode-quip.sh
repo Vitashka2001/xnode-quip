@@ -1341,7 +1341,8 @@ EOF
   docker_cli rm -f quip-dashboard >/dev/null 2>&1 || true
   compose up -d --remove-orphans quip-validator cpu
   freed="$(du -sh "$REPO_DIR/dashboard-data/dashboard.db" 2>/dev/null | cut -f1)"
-  rm -f "$REPO_DIR"/dashboard-data/dashboard.db "$REPO_DIR"/dashboard-data/dashboard.db-wal "$REPO_DIR"/dashboard-data/dashboard.db-shm
+  rm -f "$REPO_DIR"/dashboard-data/dashboard.db-wal "$REPO_DIR"/dashboard-data/dashboard.db-shm
+  release_file_slowly "$REPO_DIR/dashboard-data/dashboard.db"
   ok "Дашборд выключен, индекс удалён (освобождено ${freed:-0})."
   warn "Без дашборда нода не видна снаружи на :20049 и получает меньше поинтов. Вернуть: $0 dashboard-on"
 }
@@ -1373,10 +1374,29 @@ EOF
 # soon as the container starts. Mining and the published qblock files do not
 # depend on it. Wiping it once it passes DASHBOARD_DB_MAX_GB keeps a 50 GB VM
 # from filling up without giving up the front door. force=yes wipes regardless.
+#
+# Never free it in one go. The VMs mount / with `discard`, so deleting a 13 GB
+# file sends 13 GB of TRIM to the hypervisor's storage at once; done on twelve
+# VMs together it left each of them with the disk ~99% stalled for over an
+# hour, and the watchdog then stopped miners it could no longer reach. So the
+# file is shrunk in small steps (release_file_slowly), and the daily run waits
+# a random part of an hour first so the fleet does not trim in the same minute.
 DASHBOARD_DB_MAX_GB="${DASHBOARD_DB_MAX_GB:-4}"
+RELEASE_STEP_MB="${RELEASE_STEP_MB:-128}"
+RELEASE_PAUSE_S="${RELEASE_PAUSE_S:-5}"
+
+release_file_slowly() {
+  local file="$1" size step=$(( RELEASE_STEP_MB * 1024 * 1024 ))
+  [[ -f "$file" ]] || return 0
+  while size="$(stat -c %s "$file" 2>/dev/null)" && (( size > step )); do
+    truncate -s "$(( size - step ))" "$file" || break
+    sleep "$RELEASE_PAUSE_S"
+  done
+  rm -f "$file"
+}
 
 trim_dashboard_index() {
-  local force="${1:-no}" db="$REPO_DIR/dashboard-data/dashboard.db" size_gb
+  local force="${1:-no}" db="$REPO_DIR/dashboard-data/dashboard.db" size_gb old
   need_repo || return 1
   docker_cli ps --format '{{.Names}}' 2>/dev/null | grep -qx quip-dashboard || return 0
   [[ -f "$db" ]] || return 0
@@ -1385,11 +1405,16 @@ trim_dashboard_index() {
     say "Индекс дашборда ${size_gb}G (порог ${DASHBOARD_DB_MAX_GB}G) — не трогаю."
     return 0
   fi
+  [[ "$force" == "yes" ]] || sleep $(( RANDOM % 3600 ))
   say "Индекс дашборда ${size_gb}G — очищаю (дашборд пересоберёт его сам)."
+  old="$REPO_DIR/dashboard-data/dashboard.db.old"
   docker_cli stop -t 60 quip-dashboard >/dev/null 2>&1 || true
-  rm -f "$db" "$db-wal" "$db-shm"
+  mv -f "$db" "$old"
+  rm -f "$db-wal" "$db-shm"
   docker_cli start quip-dashboard >/dev/null 2>&1 \
     || compose up -d --pull never --no-deps dashboard
+  say "Освобождаю место постепенно (${RELEASE_STEP_MB}M каждые ${RELEASE_PAUSE_S}с)..."
+  release_file_slowly "$old"
   ok "Индекс дашборда очищен, свободно $(root_free_gb)G."
 }
 
