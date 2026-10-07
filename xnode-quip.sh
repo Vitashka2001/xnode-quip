@@ -882,18 +882,41 @@ stop_cpu_only() {
 # The dashboard image hosts the :20049 front door. When the dashboard is turned
 # off (see disable_dashboard) the miner REST is published on 127.0.0.1:8086
 # instead, so try the front door first and fall back to the direct port.
-status_json() {
-  curl -fsS --max-time 5 http://localhost:20049/api/v1/status 2>/dev/null \
-    || curl -fsS --max-time 5 http://127.0.0.1:8086/api/v1/status
+#
+# The front door is only up while the dashboard is, and the dashboard restarts
+# itself whenever its liveness check trips (after an index wipe, under IO
+# load). That outage must not read as a dead miner or validator, or the
+# watchdog restarts a healthy one — which is how two miners were left stopped.
+# So the last fallback is the container itself on the compose network.
+container_url() {
+  local ctr="$1" port="$2" ip
+  ip="$(docker_cli inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$ctr" 2>/dev/null | awk '{print $1}')"
+  [[ -n "$ip" ]] || return 1
+  echo "http://${ip}:${port}"
 }
 
-# Same for the validator RPC: front door when the dashboard runs, otherwise
-# the port published on loopback.
+status_json() {
+  local url
+  curl -fsS --max-time 5 http://localhost:20049/api/v1/status 2>/dev/null && return 0
+  curl -fsS --max-time 5 http://127.0.0.1:8086/api/v1/status 2>/dev/null && return 0
+  url="$(container_url quip-cpu 8086)" || return 1
+  curl -fsS --max-time 10 "$url/api/v1/status"
+}
+
+# Same for the validator RPC: front door when it answers, then the port
+# published on loopback (dashboard off), then the container directly.
 local_rpc_http() {
-  if docker_cli ps --format '{{.Names}}' 2>/dev/null | grep -qx quip-dashboard; then
+  local url
+  if curl -fsS --max-time 5 -o /dev/null -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"system_health","params":[]}' "$LOCAL_RPC_HTTP" 2>/dev/null; then
     echo "$LOCAL_RPC_HTTP"
-  else
+  elif curl -fsS --max-time 5 -o /dev/null -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"system_health","params":[]}' http://127.0.0.1:9944 2>/dev/null; then
     echo "http://127.0.0.1:9944"
+  elif url="$(container_url quip-validator 9944)"; then
+    echo "$url"
+  else
+    echo "$LOCAL_RPC_HTTP"
   fi
 }
 
