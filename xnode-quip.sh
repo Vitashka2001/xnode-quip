@@ -771,6 +771,12 @@ migrate_env_tags() {
 remove_override_file() {
   local override_file="$REPO_DIR/docker-compose.override.yml"
   [[ -f "$override_file" ]] || return 0
+  # Overrides this script writes now (dashboard on/off, lan-peers) are current
+  # configuration, not leftovers of the old stack.
+  if grep -q '^# Written by XNODE: ' "$override_file"; then
+    say "Override записан XNODE ($(grep -m1 -o 'Written by XNODE: [a-z -]*' "$override_file")) — оставляю."
+    return 0
+  fi
   say "Backup override: $(backup_override_file)"
   rm -f "$override_file"
   ok "docker-compose.override.yml удалён — новый стек настраивается через .env."
@@ -1203,8 +1209,11 @@ needs_aglais_migration() {
   local config_file="$REPO_DIR/data/config.toml"
 
   # Only an override from the pre-Aglais stack counts. The dashboard-off
-  # override written by disable_dashboard is current and must survive.
+  # override written by disable_dashboard is current and must survive, and so
+  # is the lan-peers one, which repeats the validator command (state-pruning
+  # included) only to add LAN neighbours as reserved peers.
   [[ -f "$REPO_DIR/docker-compose.override.yml" ]] \
+    && ! grep -q 'XNODE: lan-peers' "$REPO_DIR/docker-compose.override.yml" \
     && grep -Eq '^[[:space:]]*(postgres|caddy):|QUIP_VALIDATORS|state-pruning' "$REPO_DIR/docker-compose.override.yml" && return 0
   [[ -f "$env_file" ]] && grep -Eq '^[[:space:]]*P(U|G)ID[[:space:]]*=[[:space:]]*0[[:space:]]*$' "$env_file" && return 0
   [[ -f "$env_file" ]] && ! grep -Eq '^[[:space:]]*CHANNEL[[:space:]]*=' "$env_file" && return 0
@@ -1584,6 +1593,36 @@ recover_miner_escalate() {
   esac
 }
 
+# A narrower stall the check above cannot see: the coordinator keeps following
+# the chain (head and heads_observed move, so it counts as progress) while its
+# SA worker has stopped returning results. Seen on a LAN node for ~5 days:
+# leases staged, salts_per_s=0, results_received frozen, points flat. Healthy
+# nodes return results every few minutes, so three hours without one, with the
+# validator healthy, means the worker is wedged. Only a plain miner restart,
+# at most once per WORKER_STALL_SECONDS: this must never escalate into the
+# stack recreation the main check uses.
+WORKER_STALL_SECONDS="${WORKER_STALL_SECONDS:-10800}"
+
+worker_stall_check() {
+  local results="$1" now="$2" prev last_at last_restart
+  prev="$(health_state_get worker_results)"
+  last_at="$(health_state_get worker_results_at)"
+  last_restart="$(health_state_get worker_restart_at)"
+  [[ "$last_at" =~ ^[0-9]+$ ]] || last_at=0
+  [[ "$last_restart" =~ ^[0-9]+$ ]] || last_restart=0
+  if [[ ! "$prev" =~ ^[0-9]+$ ]] || (( last_at == 0 )) || (( results != prev )); then
+    health_state_put "worker_results=$results" "worker_results_at=$now"
+    return 0
+  fi
+  (( now - last_at >= WORKER_STALL_SECONDS )) || return 0
+  (( now - last_restart >= WORKER_STALL_SECONDS )) || return 0
+  validator_is_healthy || return 0
+  warn "Watchdog: воркер не вернул ни одного результата $(( now - last_at )) с при живой цепочке (results=$results)."
+  say "Перезапускаю miner контейнер (зависший воркер)."
+  compose restart cpu
+  health_state_put "worker_restart_at=$now" "worker_results_at=$now"
+}
+
 # Returns 0 healthy, 1 stalled (action taken), 2 undetermined.
 # Pass "report" to inspect without touching anything.
 miner_stall_check() {
@@ -1676,6 +1715,7 @@ miner_stall_check() {
         "results_received=$results" "uptime_seconds=$uptime" \
         "reference_head=$reference" \
         "last_progress_at=$now" "stall_actions=0"
+      worker_stall_check "$results" "$now"
     fi
     return 0
   fi
