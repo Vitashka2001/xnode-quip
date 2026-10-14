@@ -1320,13 +1320,17 @@ set_node_wallet() {
 # also the :20049 front door that publishes /api/v1 (miner status) and
 # /files/qblocks to the outside, and the points platform evidently checks it.
 # Prefer keeping the dashboard and trimming its index (trim_dashboard_index);
-# dashboard-on undoes this.
+# dashboard-on undoes this. The exception is a node behind NAT: nothing
+# reaches its front door anyway, so the dashboard there is pure overhead.
 #
 # The dashboard's own index (dashboard-data/dashboard.db) grows ~2.5-3 GB a day
 # per node, several times faster than the validator's archive database, and on
 # a 50 GB VM it is what fills the disk within about a week. Turning it off means:
 #   * the dashboard service is moved to a profile nobody enables, so neither
-#     `compose up` nor the watchdog brings it back;
+#     `compose up` nor the watchdog brings it back. It takes `!override`:
+#     compose appends sequences from an override, so a plain list would only
+#     add "dashboard-off" to cpu/cuda/faucet and `--profile cpu` would still
+#     start the dashboard;
 #   * the miner REST (8086) and validator RPC (9944) are published on
 #     127.0.0.1 only, so the watchdog can still see both without the :20049
 #     front door the dashboard image used to provide;
@@ -1339,7 +1343,7 @@ disable_dashboard() {
 # Written by XNODE: dashboard off. See disable_dashboard in xnode-quip.sh.
 services:
   dashboard:
-    profiles: ["dashboard-off"]
+    profiles: !override ["dashboard-off"]
   cpu:
     ports:
       - "127.0.0.1:8086:8086"
