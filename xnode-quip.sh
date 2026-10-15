@@ -16,10 +16,17 @@ ACTIVE_VALIDATORS="$LOCAL_VALIDATOR"
 FAUCET_URL="https://faucet.aglais.quip.network"
 PUBLIC_RPC="wss://bootnode-1.aglais.quip.network:20049/rpc"
 # Genesis of Aglais. Used to tell a migrated node from one still on the
-# retired chain without trusting a tag or a directory name.
-AGLAIS_GENESIS="0x59e064bddd49a920d1392693c728c3bf9867f2cf3e0f8fea8c2498b389b0c286"
+# retired chain without trusting a tag or a directory name. Aglais relaunched
+# on 2026-10-15 from a fresh genesis on runtime spec 119; the spec-117 chain
+# stopped at #613781 and is kept only to recognise nodes still on it.
+AGLAIS_GENESIS="0x542a9915acf840b8940d35ca6de242f669a0c6e3b40f9a8d8c14b9bf7b8ebecb"
+AGLAIS_117_GENESIS="0x59e064bddd49a920d1392693c728c3bf9867f2cf3e0f8fea8c2498b389b0c286"
+# Upstream published the relaunch on this branch before merging it into main.
+# Installs and updates fast-forward onto it while main lacks it; once it is
+# merged (or deleted) this is a no-op.
+UPSTREAM_RELAUNCH_REF="relaunch/aglais-spec119"
 RETIRED_GENESIS="0xa1394e7a91995ac2f60a886f804817cf7205b03e32d67ce06169f8b17337a9a7"
-# Release channel driving every image tag. Both channels run Aglais (spec 117);
+# Release channel driving every image tag. Both channels run Aglais (spec 119);
 # `latest` is pre-Aglais and must never be used.
 #
 # beta, not stable, and deliberately: the repo's main branch carries the
@@ -37,7 +44,12 @@ NODE_PGID="${XNODE_PGID:-1000}"
 # Aglais keeps chain id `quip_testnet`, so its database would land in the same
 # chains/quip_testnet subdirectory the retired chain used and be rejected on a
 # genesis mismatch. Upstream moved the base path; the old tree stays put.
-VALIDATOR_DIR_NAME="aglais-chain-db"
+# The spec-119 relaunch kept the chain id again, so upstream moved the base
+# path once more (and the dashboard data dir, whose index binds to the first
+# genesis it sees). The spec-117 directories stay until the operator deletes
+# them.
+VALIDATOR_DIR_NAME="aglais-119-chain-db"
+DASHBOARD_DATA_DIR="dashboard-data-119"
 RETIRED_VALIDATOR_DIR_NAME="validator-data"
 # Wallet the node is attributed to on the points platform. Published on chain
 # inside the node descriptor as part of [miner].node_name — that is the only
@@ -275,6 +287,17 @@ git_repo_status() {
   ok "$label: Git repo актуален."
 }
 
+# Fast-forward onto the upstream relaunch branch when main does not carry it
+# yet. Returns quietly when the branch is gone or already contained.
+join_relaunch_ref() {
+  local dir="$1"
+  [[ -d "$dir/.git" ]] || return 0
+  git -C "$dir" fetch --quiet origin "$UPSTREAM_RELAUNCH_REF" 2>/dev/null || return 0
+  git -C "$dir" merge-base --is-ancestor FETCH_HEAD HEAD 2>/dev/null && return 0
+  say "Перехожу на $UPSTREAM_RELAUNCH_REF (Aglais spec 119)..."
+  run git -C "$dir" merge --ff-only FETCH_HEAD
+}
+
 git_repo_pull_ff() {
   local dir="$1"
   local label="$2"
@@ -338,6 +361,7 @@ install_repositories() {
     fi
   fi
   clone_or_update_repo "$REPO_URL" "$REPO_DIR" "nodes.quip.network" "$pull_mode"
+  join_relaunch_ref "$REPO_DIR"
   clone_or_update_repo "$FAUCET_REPO_URL" "$FAUCET_DIR" "faucet" "$pull_mode"
 }
 
@@ -1197,6 +1221,7 @@ node_network() {
   g="$(chain_genesis "$LOCAL_VALIDATOR" 2>/dev/null || true)"
   case "$g" in
     "$AGLAIS_GENESIS")  echo "aglais" ;;
+    "$AGLAIS_117_GENESIS") echo "aglais-117 (остановлена, нужен relaunch)" ;;
     "$RETIRED_GENESIS") echo "retired" ;;
     "")                 echo "unknown" ;;
     *)                  echo "other:$g" ;;
@@ -1353,9 +1378,9 @@ services:
 EOF
   docker_cli rm -f quip-dashboard >/dev/null 2>&1 || true
   compose up -d --remove-orphans quip-validator cpu
-  freed="$(du -sh "$REPO_DIR/dashboard-data/dashboard.db" 2>/dev/null | cut -f1)"
-  rm -f "$REPO_DIR"/dashboard-data/dashboard.db-wal "$REPO_DIR"/dashboard-data/dashboard.db-shm
-  release_file_slowly "$REPO_DIR/dashboard-data/dashboard.db"
+  freed="$(du -sh "$REPO_DIR/$DASHBOARD_DATA_DIR/dashboard.db" 2>/dev/null | cut -f1)"
+  rm -f "$REPO_DIR/$DASHBOARD_DATA_DIR"/dashboard.db-wal "$REPO_DIR/$DASHBOARD_DATA_DIR"/dashboard.db-shm
+  release_file_slowly "$REPO_DIR/$DASHBOARD_DATA_DIR/dashboard.db"
   ok "Дашборд выключен, индекс удалён (освобождено ${freed:-0})."
   warn "Без дашборда нода не видна снаружи на :20049 и получает меньше поинтов. Вернуть: $0 dashboard-on"
 }
@@ -1409,7 +1434,7 @@ release_file_slowly() {
 }
 
 trim_dashboard_index() {
-  local force="${1:-no}" db="$REPO_DIR/dashboard-data/dashboard.db" size_gb old
+  local force="${1:-no}" db="$REPO_DIR/$DASHBOARD_DATA_DIR/dashboard.db" size_gb old
   need_repo || return 1
   docker_cli ps --format '{{.Names}}' 2>/dev/null | grep -qx quip-dashboard || return 0
   [[ -f "$db" ]] || return 0
@@ -1420,7 +1445,7 @@ trim_dashboard_index() {
   fi
   [[ "$force" == "yes" ]] || sleep $(( RANDOM % 3600 ))
   say "Индекс дашборда ${size_gb}G — очищаю (дашборд пересоберёт его сам)."
-  old="$REPO_DIR/dashboard-data/dashboard.db.old"
+  old="$REPO_DIR/$DASHBOARD_DATA_DIR/dashboard.db.old"
   docker_cli stop -t 60 quip-dashboard >/dev/null 2>&1 || true
   mv -f "$db" "$old"
   rm -f "$db-wal" "$db-shm"
@@ -2556,7 +2581,7 @@ install_node() {
   section "Установка / восстановление Quip CPU node"
   kv "Режим" "CPU miner, GPU не нужен"
   kv "Дашборд" "HTTP на :20049, домен не нужен"
-  kv "Сеть" "Aglais (тестовая сеть Quip, spec 117)"
+  kv "Сеть" "Aglais (тестовая сеть Quip, spec 119)"
   kv "RPC miner" "локальный validator — штатная конфигурация Aglais"
   kv "Локальный validator" "запускается pruned и синхронизируется в фоне"
   kv "Папка установки" "$BASE_DIR"
@@ -3418,6 +3443,7 @@ update_node() {
 
   section "Git repos"
   git_repo_pull_ff "$REPO_DIR" "nodes.quip.network"
+  join_relaunch_ref "$REPO_DIR"
   git_repo_pull_ff "$FAUCET_DIR" "faucet" || true
 
   # Order matters: the freshly pulled compose file points the miner at the v0.3
