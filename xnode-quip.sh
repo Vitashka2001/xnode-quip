@@ -2069,8 +2069,17 @@ auto_recover_once() {
     # Container down (e.g. stopped earlier because topology was missing, and it
     # is back now) is the one case that needs a plain start rather than the
     # progress check, which would just read a silent REST.
+    # Start what is already here before anything that pulls. With
+    # pull_policy: always a plain `compose up` first pulls every image; on
+    # 2026-10-15 the miner's registry path stopped resolving ("access
+    # forbidden"), every such run failed, and the whole fleet sat with its
+    # miners stopped for hours although their images were still on disk.
     if [[ "$(miner_state)" != "running" ]]; then
-      say "Topology есть, а miner контейнер не запущен. Поднимаю stack..."
+      say "Topology есть, а miner контейнер не запущен. Поднимаю..."
+      docker_cli start quip-cpu >/dev/null 2>&1 && { ok "Miner запущен (docker start)."; return 0; }
+      clean_stale_containers quip-cpu
+      compose up -d --pull never && return 0
+      warn "Без скачивания не поднялся — пробую с pull."
       compose up -d
       return 0
     fi
