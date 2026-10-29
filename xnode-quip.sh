@@ -1843,6 +1843,9 @@ validator_stall_check() {
   if [[ "$(docker_cli inspect -f '{{.State.Status}}' quip-validator 2>/dev/null || echo missing)" != "running" ]]; then
     if [[ "$mode" != "report" ]] && [[ "$(docker_cli inspect -f '{{.State.Status}}' quip-cpu 2>/dev/null)" == "running" ]]; then
       bad "Validator не запущен, а майнер работает — это сбой. Поднимаю validator."
+      # compose can report an exited container as "Running" and then do nothing;
+      # that kept one validator down for two weeks.
+      docker_cli start quip-validator >/dev/null 2>&1 && { ok "Validator запущен (docker start)."; return 0; }
       clean_stale_containers quip-validator
       compose up -d --pull never --no-deps quip-validator
     fi
